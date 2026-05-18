@@ -111,18 +111,86 @@ def _soap_call(action: str, body_xml: str, timeout: int = 30) -> ET.Element:
     return ET.fromstring(resp.content)
 
 
+def _parse_int_result(root: ET.Element, result_tag: str) -> int | None:
+    """Extract a numeric SOAP result, treating -1 (CBR 'not found') as None."""
+    el = root.find(f".//w:{result_tag}", CBR_NS)
+    if el is None or not el.text:
+        return None
+    try:
+        val = int(float(el.text))
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None  # CBR uses 0 / -1 for "not found"
+
+
 def bic_to_internal_code(bic: str) -> int | None:
-    """Call BicToIntCode and return the internal CBR credit-org code."""
+    """Call BicToIntCode. Returns None for branch BICs (CBR replies with -1)."""
     body = (
         f'<BicToIntCode xmlns="http://web.cbr.ru/">'
         f"<BicCode>{bic}</BicCode>"
         f"</BicToIntCode>"
     )
     root = _soap_call("BicToIntCode", body)
-    el = root.find(".//w:BicToIntCodeResult", CBR_NS)
-    if el is None or not el.text or float(el.text) == 0:
-        return None
-    return int(float(el.text))
+    return _parse_int_result(root, "BicToIntCodeResult")
+
+
+def bic_to_reg_number(bic: str) -> int | None:
+    """Call BicToRegNumber. Resolves to the *parent* credit org's reg number,
+    so it works for branch BICs where BicToIntCode returns -1."""
+    body = (
+        f'<BicToRegNumber xmlns="http://web.cbr.ru/">'
+        f"<BicCode>{bic}</BicCode>"
+        f"</BicToRegNumber>"
+    )
+    root = _soap_call("BicToRegNumber", body)
+    return _parse_int_result(root, "BicToRegNumberResult")
+
+
+def reg_number_to_internal_code(reg_number: int) -> int | None:
+    """Call RegNumToIntCode. Final step of the branch-BIC fallback chain."""
+    body = (
+        f'<RegNumToIntCode xmlns="http://web.cbr.ru/">'
+        f"<RegNum>{reg_number}</RegNum>"
+        f"</RegNumToIntCode>"
+    )
+    root = _soap_call("RegNumToIntCode", body)
+    return _parse_int_result(root, "RegNumToIntCodeResult")
+
+
+def resolve_bic_to_internal_code(bic: str) -> tuple[int | None, list[str]]:
+    """Two-track resolution for the internal credit-org code.
+
+    Track A (fast path, head-office BICs): BicToIntCode → done.
+    Track B (branch BICs, fallback): BicToRegNumber → RegNumToIntCode.
+
+    Returns (internal_code or None, trace) where trace is a human-readable
+    list of attempted steps for surfacing in the UI.
+    """
+    trace: list[str] = []
+    try:
+        ic = bic_to_internal_code(bic)
+        if ic is not None:
+            trace.append(f"BicToIntCode({bic}) → {ic} ✓")
+            return ic, trace
+        trace.append(f"BicToIntCode({bic}) → -1 (branch BIC or not registered)")
+    except Exception as e:
+        trace.append(f"BicToIntCode({bic}) raised: {e}")
+
+    try:
+        rn = bic_to_reg_number(bic)
+        if rn is None:
+            trace.append(f"BicToRegNumber({bic}) → not found")
+            return None, trace
+        trace.append(f"BicToRegNumber({bic}) → reg №{rn}")
+        ic = reg_number_to_internal_code(rn)
+        if ic is None:
+            trace.append(f"RegNumToIntCode({rn}) → not found")
+            return None, trace
+        trace.append(f"RegNumToIntCode({rn}) → {ic} ✓ (resolved via parent credit org)")
+        return ic, trace
+    except Exception as e:
+        trace.append(f"Fallback chain raised: {e}")
+        return None, trace
 
 
 def internal_code_to_credit_info(int_code: int) -> ET.Element | None:
@@ -214,23 +282,33 @@ def extract_all_values(credit_info: ET.Element, *attr_names: str) -> list[str]:
 
 
 def cbr_lookup(bic: str) -> dict[str, Any]:
-    """Full Step-1 chain. Returns {internal_code, swift_codes, names, ...} or {error}."""
-    try:
-        int_code = bic_to_internal_code(bic)
-    except Exception as e:
-        return {"error": f"CBR BicToIntCode failed: {e}"}
+    """Full Step-1 chain. Returns {internal_code, swift_codes, names, ...} or {error}.
+
+    Uses the two-track resolver: tries BicToIntCode first, falls back to
+    BicToRegNumber → RegNumToIntCode for branch BICs.
+    """
+    int_code, trace = resolve_bic_to_internal_code(bic)
     if int_code is None:
-        return {"error": f"BIC {bic} not found in CBR registry"}
+        return {
+            "error": f"BIC {bic} not resolvable via CBR",
+            "resolution_trace": trace,
+        }
 
     try:
         credit_info = internal_code_to_credit_info(int_code)
     except Exception as e:
         return {
             "internal_code": int_code,
+            "resolution_trace": trace,
             "error": f"CBR CreditInfoByIntCodeExXML failed: {e}",
         }
     if credit_info is None:
-        return {"internal_code": int_code, "swift_codes": [], "warning": "Empty CO record"}
+        return {
+            "internal_code": int_code,
+            "resolution_trace": trace,
+            "swift_codes": [],
+            "warning": "Empty CO record",
+        }
 
     swifts = extract_swift_codes(credit_info)
     all_bics = extract_all_bics(credit_info)
@@ -253,17 +331,18 @@ def cbr_lookup(bic: str) -> dict[str, Any]:
 
     return {
         "internal_code": int_code,
-        "bik_codes": all_bics,                          # NEW: all BICs (head + branches)
+        "resolution_trace": trace,                      # NEW: how we got int_code
+        "bik_codes": all_bics,
         "swift_codes": swifts,
         "primary_swift": swifts[0] if swifts else None,
-        "short_names_cbr": short_names,                 # NEW: list
-        "full_names_cbr": full_names,                   # NEW: list
+        "short_names_cbr": short_names,
+        "full_names_cbr": full_names,
         "inn_cbr": inns[0] if inns else None,
         "ogrn_cbr": ogrns[0] if ogrns else None,
         "regn_cbr": regns[0] if regns else None,
-        "kpp_codes_cbr": kpps,                          # NEW: list
-        "addresses_cbr": addresses,                     # NEW: list
-        "raw_xml": raw_xml,                             # NEW: debug
+        "kpp_codes_cbr": kpps,
+        "addresses_cbr": addresses,
+        "raw_xml": raw_xml,
     }
 
 
@@ -466,40 +545,50 @@ st.markdown(f"### Screening BIC `{bic}`")
 # ─── STEP 1 ──────────────────────────────────────────────────────────────────
 with st.status("Step 1 · CBR: resolve BIC → internal code → SWIFT", expanded=True) as status:
     cbr = cbr_lookup(bic)
+
+    # Always show how we tried to resolve the BIC (helps diagnose -1 / branch BICs)
+    trace = cbr.get("resolution_trace") or []
+    if trace:
+        st.markdown("**Resolution trace:**")
+        for line in trace:
+            st.markdown(f"- {line}")
+
     if cbr.get("error"):
-        st.error(cbr["error"])
-        status.update(label=f"Step 1 · {cbr['error']}", state="error")
-        st.stop()
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Internal CBR code", cbr.get("internal_code") or "—")
-    c2.metric("SWIFTs found", len(cbr.get("swift_codes", [])))
-    c3.metric("BICs in record", len(cbr.get("bik_codes", [])))
-
-    if cbr.get("swift_codes"):
-        st.write("**SWIFT codes registered:**", ", ".join(f"`{s}`" for s in cbr["swift_codes"]))
-    else:
         st.warning(
-            "No SWIFT codes registered in CBR for this BIC. "
-            "Bank likely operates only domestically (RUB) or routes FX through correspondents."
+            f"⚠️ {cbr['error']}. Continuing with bik-info.ru — the bank can still "
+            "be screened by name + INN + BIC even without CBR's full record."
         )
+        status.update(label=f"Step 1 · CBR unresolved (continuing)", state="error")
+        # Don't stop — fall through to Step 2. cbr dict has empty fields, which
+        # the downstream code handles via `cbr.get(...)` everywhere.
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Internal CBR code", cbr.get("internal_code") or "—")
+        c2.metric("SWIFTs found", len(cbr.get("swift_codes", [])))
+        c3.metric("BICs in record", len(cbr.get("bik_codes", [])))
 
-    if cbr.get("bik_codes"):
-        st.write(
-            "**All BICs in CBR record (head office + branches):**",
-            ", ".join(f"`{b}`" for b in cbr["bik_codes"]),
-        )
-        # Flag if the input BIC isn't the head office — relevant for sanctions screening
-        if bic in cbr["bik_codes"] and len(cbr["bik_codes"]) > 1:
-            other_bics = [b for b in cbr["bik_codes"] if b != bic]
-            st.info(
-                f"`{bic}` is one of {len(cbr['bik_codes'])} BICs registered for this credit organization. "
-                f"OpenSanctions typically keys on the head-office BIC — sending all of them ensures the match lands."
+        if cbr.get("swift_codes"):
+            st.write("**SWIFT codes registered:**", ", ".join(f"`{s}`" for s in cbr["swift_codes"]))
+        else:
+            st.warning(
+                "No SWIFT codes registered in CBR for this BIC. "
+                "Bank likely operates only domestically (RUB) or routes FX through correspondents."
             )
 
-    with st.expander("Raw CBR XML response (debug)"):
-        st.code(cbr.get("raw_xml") or "(empty)", language="xml")
-    status.update(label="Step 1 · CBR resolved", state="complete")
+        if cbr.get("bik_codes"):
+            st.write(
+                "**All BICs in CBR record (head office + branches):**",
+                ", ".join(f"`{b}`" for b in cbr["bik_codes"]),
+            )
+            if bic in cbr["bik_codes"] and len(cbr["bik_codes"]) > 1:
+                st.info(
+                    f"`{bic}` is one of {len(cbr['bik_codes'])} BICs registered for this credit organization. "
+                    f"OpenSanctions typically keys on the head-office BIC — sending all of them ensures the match lands."
+                )
+
+        with st.expander("Raw CBR XML response (debug)"):
+            st.code(cbr.get("raw_xml") or "(empty)", language="xml")
+        status.update(label="Step 1 · CBR resolved", state="complete")
 
 # ─── STEP 2 ──────────────────────────────────────────────────────────────────
 with st.status("Step 2 · bik-info.ru: bank name & address + transliteration", expanded=True) as status:
