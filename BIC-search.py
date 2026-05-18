@@ -290,6 +290,47 @@ def detect_parent_bank(entity: dict, current_bik: str | None = None) -> dict | N
     return None
 
 
+# Markers used by `_is_bank_entity` to recognize bank/financial entities by name
+_BANK_NAME_MARKERS: tuple[str, ...] = (
+    "БАНК", "BANK", " КБ ", " АКБ ", " ИКБ ", " АКИБ ",
+    " НКО ", " РНКО ", " AO ", " АО ",  # weak markers, used in combination
+)
+_STRONG_BANK_MARKERS: tuple[str, ...] = (
+    "БАНК", "BANK", " КБ ", " АКБ ", " ИКБ ", " АКИБ ",
+    " НКО ", " РНКО ",
+)
+
+
+def _is_bank_entity(entity: dict) -> bool:
+    """Heuristic: does this OpenSanctions entity describe a bank/credit institution?
+
+    Used to reject sanctioned non-bank entities (charities, individuals,
+    companies) that reference a BIK *as their bank account*. Ukraine NSDC
+    in particular records each sanctioned entity's bank account BIK as a
+    referent, so without this filter ``/entities/ru-bik-{X}`` can return
+    e.g. a sanctioned Russian charity whose account happens to be at BIK X
+    rather than the bank itself.
+
+    Returns True if any of:
+    - Entity is in the ``ru_cbr_banks`` dataset (authoritative bank flag)
+    - Entity has a non-empty ``swiftBic`` property
+    - Entity's name/caption contains a strong bank marker (БАНК/BANK/КБ/etc.)
+    """
+    if not entity:
+        return False
+    datasets = entity.get("datasets", []) or []
+    if BANKS_DATASET in datasets:
+        return True
+    props = entity.get("properties", {}) or {}
+    if props.get("swiftBic"):
+        return True
+    name_parts: list[str] = [str(entity.get("caption") or "")]
+    for k in ("name", "alias", "previousName"):
+        name_parts.extend(str(v) for v in (props.get(k) or []))
+    haystack = f" {' '.join(name_parts).upper()} "
+    return any(marker in haystack for marker in _STRONG_BANK_MARKERS)
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
     """Resolve a Russian BIK to an OpenSanctions entity — strict, no guessing.
@@ -316,9 +357,39 @@ def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
        to mis-attribute sanctions to the wrong institution.
     """
     # --- Step 1: direct entity-by-referent lookup --------------------------
-    # OpenSanctions' /entities/{id} endpoint accepts source IDs too — so
+    # --- Step 1: search the CBR banks dataset directly --------------------
+    # The `ru_cbr_banks` dataset is the AUTHORITATIVE source for Russian
+    # banks indexed by BIK. Searching it first guarantees we find the bank
+    # entity itself rather than e.g. a sanctioned charity whose bank
+    # account happens to use this BIK (Ukraine NSDC records bank account
+    # BIKs as referents on the sanctioned entity, which would otherwise be
+    # returned by the direct ``/entities/ru-bik-{BIK}`` lookup below).
+    for q in (f'identifiers:"{bik}"', f'referents:"ru-bik-{bik}"', bik):
+        try:
+            resp = requests.get(
+                f"{OS_BASE}/search/{BANKS_DATASET}",
+                params={"q": q, "limit": 10},
+                headers=os_headers(api_key),
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+        except requests.RequestException:
+            continue
+        for r in resp.json().get("results", []) or []:
+            if _entity_contains_bik(r, bik):
+                # Resolve to the canonical entity (which may carry sanctions
+                # via deduplication into a sanctioned legal entity, e.g.
+                # ru_cbr_banks stub for Sberbank merges into the canonical
+                # sanctioned Sberbank entity).
+                full = fetch_full_entity(r["id"], api_key) or r
+                return full
+
+    # --- Step 2: direct entity-by-referent lookup (validated) --------------
+    # OpenSanctions' /entities/{id} accepts source IDs too, so
     # GET /entities/ru-bik-044525974 returns the canonical (possibly
-    # deduplicated and sanctions-tagged) entity directly.
+    # deduplicated and sanctions-tagged) entity directly. We accept it ONLY
+    # if it looks like a bank — otherwise it may be e.g. a sanctioned
+    # charity that uses this BIK as its bank account.
     try:
         resp = requests.get(
             f"{OS_BASE}/entities/ru-bik-{bik}",
@@ -328,28 +399,24 @@ def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
         )
         if resp.status_code == 200:
             entity = resp.json()
-            if entity and _entity_contains_bik(entity, bik):
+            if (entity and _entity_contains_bik(entity, bik)
+                    and _is_bank_entity(entity)):
                 return entity
-        # 404 is the expected miss — fall through to /search
+        # 404 is the expected miss; non-bank match also falls through
     except requests.RequestException:
         pass
 
-    # --- Step 2: Lucene-based /search across both scopes -------------------
+    # --- Step 3: Lucene-based /search across other scopes (validated) -----
     attempts: list[tuple[str, str]] = [
-        # (scope, lucene query) — most specific first
-        ("default",       f'referents:"ru-bik-{bik}"'),
-        ("sanctions",     f'referents:"ru-bik-{bik}"'),
-        ("default",       f'identifiers:"{bik}"'),
-        ("sanctions",     f'identifiers:"{bik}"'),
-        (BANKS_DATASET,   f'identifiers:"{bik}"'),
-        (BANKS_DATASET,   bik),  # text-mode fallback inside the CBR dataset only
+        ("default",   f'referents:"ru-bik-{bik}"'),
+        ("sanctions", f'referents:"ru-bik-{bik}"'),
+        ("default",   f'identifiers:"{bik}"'),
+        ("sanctions", f'identifiers:"{bik}"'),
     ]
-
     for scope, q in attempts:
-        url = f"{OS_BASE}/search/{scope}"
         try:
             resp = requests.get(
-                url,
+                f"{OS_BASE}/search/{scope}",
                 params={"q": q, "limit": 10},
                 headers=os_headers(api_key),
                 timeout=REQUEST_TIMEOUT,
@@ -357,11 +424,9 @@ def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
             resp.raise_for_status()
         except requests.RequestException:
             continue
-        results = resp.json().get("results", []) or []
-        for r in results:
-            if _entity_contains_bik(r, bik):
+        for r in resp.json().get("results", []) or []:
+            if _entity_contains_bik(r, bik) and _is_bank_entity(r):
                 return r
-        # else: every result for this query failed strict validation → try next
 
     return None
 
