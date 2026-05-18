@@ -662,20 +662,129 @@ def name_token_overlap(input_names: list[str], candidate_props: dict) -> list[st
     return sorted(input_tokens & candidate_tokens)
 
 
-def compute_verdict(score: float, token_overlap: list[str]) -> tuple[str, str, str]:
-    """(label, emoji, reason) for a single candidate. Score and token overlap
-    are independent signals — token overlap can escalate verdict on its own."""
-    if score >= SCORE_HIT:
-        return ("MATCH", "🔴", f"score {score:.2f} ≥ {SCORE_HIT:.2f}")
-    if score >= SCORE_REVIEW:
-        return ("REVIEW", "🟡", f"score {score:.2f} ≥ {SCORE_REVIEW:.2f}")
-    if token_overlap:
+# Topic codes from OpenSanctions' risk-tagging system.
+# https://www.opensanctions.org/docs/topics/
+# Sanction topics: entity is on an active sanctions list (any jurisdiction).
+SANCTION_TOPICS: set[str] = {
+    "sanction", "sanction.linked", "sanction.counter", "sanction.counter.linked",
+    "asset.frozen", "wanted",
+}
+# Risk topics: entity carries elevated compliance risk but is not directly sanctioned.
+# Covers PEPs, organised crime, regulatory action, export control, debarment.
+RISK_TOPICS: set[str] = {
+    "debarment",
+    "crime", "crime.fraud", "crime.cyber", "crime.fin", "crime.theft",
+    "crime.war", "crime.boss", "crime.terror", "crime.traffick",
+    "forced.labor",
+    "role.pep", "role.rca", "role.oligarch", "role.spy", "poi",
+    "reg.warn", "reg.action",
+    "export.control", "export.risk",
+}
+# Display labels for topic chips (most common ones).
+TOPIC_LABELS: dict[str, str] = {
+    "sanction": "🔴 Sanctioned",
+    "sanction.linked": "🟠 Sanction-linked",
+    "sanction.counter": "🟠 Counter-sanctioned",
+    "asset.frozen": "🔴 Assets frozen",
+    "wanted": "🔴 Wanted",
+    "debarment": "🟠 Debarred",
+    "crime": "🟠 Crime-linked",
+    "crime.fraud": "🟠 Fraud",
+    "crime.fin": "🟠 Financial crime",
+    "crime.terror": "🔴 Terrorism",
+    "crime.war": "🔴 War crimes",
+    "role.pep": "🟡 PEP",
+    "role.rca": "🟡 PEP close associate",
+    "role.oligarch": "🟡 Oligarch",
+    "reg.warn": "⚠️ Regulatory warning",
+    "reg.action": "⚠️ Regulatory action",
+    "export.control": "📦 Export-controlled",
+    "fin.bank": "🏦 Bank",
+    "corp.public": "🏛️ Publicly listed",
+}
+
+
+def classify_risk(topics: list[str] | None) -> tuple[str, list[str]]:
+    """Classify a candidate's risk based on its OpenSanctions topics.
+
+    Returns (class, matched_topics) where class is one of:
+        - SANCTIONED: entity has at least one sanction topic
+        - RISK_TAGGED: entity has risk topics but no sanction topics
+        - NO_TAGS: entity in OS but has no risk indications at all (e.g. just `fin.bank`)
+    """
+    t = set(topics or [])
+    s_match = sorted(t & SANCTION_TOPICS)
+    if s_match:
+        return "SANCTIONED", s_match
+    r_match = sorted(t & RISK_TOPICS)
+    if r_match:
+        return "RISK_TAGGED", r_match
+    return "NO_TAGS", []
+
+
+def compute_verdict(
+    score: float,
+    token_overlap: list[str],
+    candidate_props: dict | None = None,
+) -> tuple[str, str, str]:
+    """Verdict combining identity confidence + OS risk classification.
+
+    Identity confidence:
+        HIGH: score ≥ SCORE_HIT, OR token_overlap with score ≥ 0.30
+        MODERATE: score ≥ SCORE_REVIEW, OR token_overlap alone
+        LOW: neither
+    Risk class (from candidate's OS topics):
+        SANCTIONED / RISK_TAGGED / NO_TAGS
+
+    Combined label hierarchy (worst signal wins):
+        🔴 SANCTIONED — identity ≥ MODERATE AND risk = SANCTIONED
+        🟠 RISK-TAGGED — identity ≥ MODERATE AND risk = RISK_TAGGED
+        🟡 IDENTIFIED — identity = HIGH AND risk = NO_TAGS (Kontur Bank case)
+        🟡 POSSIBLE — identity = MODERATE AND risk = NO_TAGS
+        🟢 NOT IN OS — identity = LOW
+
+    The 🟡 IDENTIFIED outcome is the important one: we found the entity in OS
+    but OS has no risk tags. This does NOT mean the entity is safe — only that
+    OS hasn't tagged it. For Russian banks this is common (OS only tracks
+    individually-designated entities, not sectoral risk).
+    """
+    candidate_props = candidate_props or {}
+    topics = candidate_props.get("topics") or []
+    risk_class, matched = classify_risk(topics)
+
+    if score >= SCORE_HIT or (token_overlap and score >= 0.30):
+        identity = "HIGH"
+    elif score >= SCORE_REVIEW or token_overlap:
+        identity = "MODERATE"
+    else:
+        identity = "LOW"
+
+    if identity != "LOW" and risk_class == "SANCTIONED":
         return (
-            "REVIEW",
-            "🟡",
-            f"name token overlap: {', '.join(token_overlap)} (score {score:.2f} alone is below review)",
+            "SANCTIONED",
+            "🔴",
+            f"matched entity is on a sanctions list (topics: {', '.join(matched)})",
         )
-    return ("LIKELY CLEAR", "🟢", f"score {score:.2f}, no name overlap")
+    if identity != "LOW" and risk_class == "RISK_TAGGED":
+        return (
+            "RISK-TAGGED",
+            "🟠",
+            f"matched entity carries risk topics: {', '.join(matched)}",
+        )
+    if identity == "HIGH":
+        reason = (
+            f"identity confirmed (score {score:.2f}"
+            + (f", overlap: {', '.join(token_overlap)}" if token_overlap else "")
+            + ") but OpenSanctions has no risk tags — verify against OFAC/EU/UK lists"
+        )
+        return ("IDENTIFIED", "🟡", reason)
+    if identity == "MODERATE":
+        return (
+            "POSSIBLE MATCH",
+            "🟡",
+            "possibly the same entity — review evidence and check external sources",
+        )
+    return ("NOT IN OS", "🟢", f"score {score:.2f}, no overlap — probably not this entity")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -704,10 +813,18 @@ with st.sidebar:
             "`.streamlit/secrets.toml` or env var `OPENSANCTIONS_API_KEY`."
         )
     st.markdown(
-        "**Score thresholds**  \n"
-        f"🔴 Match: ≥ {SCORE_HIT:.2f}  \n"
-        f"🟡 Review: ≥ {SCORE_REVIEW:.2f}  \n"
-        "🟢 Likely clear: below"
+        "**Verdict legend**  \n"
+        "🔴 Sanctioned — OS sanction topic + identity match  \n"
+        "🟠 Risk-tagged — OS risk topic (PEP, debarment, crime, regulatory)  \n"
+        "🟡 Identified — found in OS but no risk tags (verify externally)  \n"
+        "🟡 Possible — moderate identity confidence  \n"
+        "🟢 Not in OS — no good identity match"
+    )
+    st.markdown(
+        "---  \n"
+        "**Russian banks: always EDD.**  \n"
+        "OpenSanctions only tracks individually-designated entities. "
+        "All Russian banks carry sectoral, secondary, and evasion-conduit risk."
     )
 
 col1, col2 = st.columns([3, 1])
@@ -982,32 +1099,97 @@ with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as
 # ─── STEP 4 ──────────────────────────────────────────────────────────────────
 st.markdown("## Step 4 · Verdict")
 
+# Jurisdiction risk banner — shown for every Russian BIC, regardless of OS findings.
+# This addresses the gap where OpenSanctions only tracks individually-designated
+# entities and misses sectoral/secondary risk for unflagged Russian banks.
+# Source basis:
+#   - OFAC Treasury press release JY2725 (Nov 2024): 50+ Russian banks designated
+#     under E.O. 14024 in a single action, with explicit warning that "Sanctioned
+#     actors have been known to turn to smaller banks ... in an attempt to evade
+#     sanctions as Russia seeks new ways to access the international financial system"
+#   - EU 20th sanctions package (April 2026): introduces "anti-circumvention" tool
+#     that treats evasion architectures as sanctionable in their own right
+#   - SWIFT exclusion of most major Russian banks since 2022
+st.warning(
+    "🇷🇺 **Russian banking sector — Enhanced Due Diligence required regardless of below findings.**  \n\n"
+    "OpenSanctions only tracks **individually-designated** entities. It does NOT cover sectoral risk. "
+    "All Russian banks carry elevated compliance risk because:\n"
+    "- OFAC has designated 50+ Russian banks under E.O. 14024 since 2022, and explicitly warns that "
+    "smaller regional banks are used to evade sanctions  \n"
+    "- EU's 20-package sanctions regime now includes anti-circumvention measures (April 2026)  \n"
+    "- Russian banks face SWIFT restrictions and secondary-sanctions exposure for non-Russian counterparties  \n"
+    "- Cross-border payment infrastructure has fundamentally degraded since 2022\n\n"
+    "**A 🟡 IDENTIFIED or 🟢 NOT IN OS verdict below does NOT mean safe.** "
+    "It only means OpenSanctions has not individually flagged this bank."
+)
+
+# External-source verification links — always available for the analyst
+display_name = name_ru or short_name_ru or ""
+display_name_en = transliterate_ru(display_name) if display_name else ""
+search_handle = display_name_en or display_name or bic
+from urllib.parse import quote_plus
+q = quote_plus(search_handle)
+inn_q = quote_plus(inn_final or "")
+st.markdown(
+    "**Cross-check against primary sanctions sources:**  \n"
+    f"🇺🇸 [OFAC SDN Search](https://sanctionssearch.ofac.treas.gov/) · "
+    f"🇪🇺 [EU Sanctions Map](https://www.sanctionsmap.eu/#/main) · "
+    f"🇬🇧 [UK Sanctions List](https://www.gov.uk/government/publications/the-uk-sanctions-list) · "
+    f"🇨🇭 [Swiss SECO](https://www.seco.admin.ch/seco/en/home/Aussenwirtschaftspolitik_Wirtschaftliche_Zusammenarbeit/Wirtschaftsbeziehungen/exportkontrollen-und-sanktionen/sanktionen-embargos/sanktionsmassnahmen.html) · "
+    f"📰 [Google News search](https://www.google.com/search?tbm=nws&q={q}+sanctions) · "
+    f"🌐 [DuckDuckGo](https://duckduckgo.com/?q={q}+sanctions+OFAC+EU)  \n"
+    f"_Bank name to search:_ `{display_name}` / `{display_name_en}`"
+    + (f"  \n_INN:_ `{inn_final}`" if inn_final else "")
+)
+
+st.markdown("---")
+
 if not results:
-    st.success("🟢 **No matches in OpenSanctions** — no candidate entities returned for this bank.")
+    st.info(
+        "🟢 **No matches in OpenSanctions** — no candidate entities returned. "
+        "This is consistent with the bank not being individually flagged. "
+        "Russian banking jurisdiction risk (see banner above) still applies."
+    )
 else:
-    # Compute per-candidate verdicts using both score and name-token overlap
+    # Compute per-candidate verdicts using score + token overlap + OS topics
     candidate_verdicts = []
     for r in results:
         score = r.get("score") or 0
         props = r.get("properties", {})
         overlap = name_token_overlap(names, props)
-        label, emoji, reason = compute_verdict(score, overlap)
+        label, emoji, reason = compute_verdict(score, overlap, props)
         candidate_verdicts.append((r, score, overlap, label, emoji, reason))
 
     # Overall verdict = worst (most severe) of all candidates
-    severity = {"MATCH": 3, "REVIEW": 2, "LIKELY CLEAR": 1}
-    candidate_verdicts.sort(key=lambda t: (severity[t[3]], t[1]), reverse=True)
-    _, top_score, top_overlap, top_label, top_emoji, top_reason = candidate_verdicts[0]
+    severity = {
+        "SANCTIONED": 5,
+        "RISK-TAGGED": 4,
+        "IDENTIFIED": 3,
+        "POSSIBLE MATCH": 2,
+        "NOT IN OS": 1,
+    }
+    candidate_verdicts.sort(key=lambda t: (severity.get(t[3], 0), t[1]), reverse=True)
+    _, top_score, _top_overlap, top_label, top_emoji, top_reason = candidate_verdicts[0]
 
-    if top_label == "MATCH":
-        st.error(f"{top_emoji} **{top_label}** — {top_reason}. Investigate before transacting.")
-    elif top_label == "REVIEW":
-        st.warning(f"{top_emoji} **{top_label}** — {top_reason}. Manual review required.")
+    if top_label == "SANCTIONED":
+        st.error(f"{top_emoji} **{top_label}** — {top_reason}.  Do not transact.")
+    elif top_label == "RISK-TAGGED":
+        st.error(f"{top_emoji} **{top_label}** — {top_reason}.  Investigate before transacting.")
+    elif top_label == "IDENTIFIED":
+        st.warning(
+            f"{top_emoji} **{top_label}** — {top_reason}.  "
+            f"Apply Russian banking EDD per banner above."
+        )
+    elif top_label == "POSSIBLE MATCH":
+        st.warning(f"{top_emoji} **{top_label}** — {top_reason}.")
     else:
-        st.success(f"{top_emoji} **{top_label}** — {top_reason}. Likely false positive.")
+        st.info(f"{top_emoji} **{top_label}** — {top_reason}.")
 
     st.markdown("### Candidates")
     for r, score, overlap, label, emoji, reason in candidate_verdicts:
+        props = r.get("properties", {})
+        topics = props.get("topics") or []
+        topic_chips = " ".join(TOPIC_LABELS.get(t, f"`{t}`") for t in topics) if topics else "_(no risk topics in OS)_"
         title_extra = f" · 🔗 overlap: {', '.join(overlap)}" if overlap else ""
         with st.expander(
             f"{emoji}  {r.get('caption', '(no caption)')}  ·  score {score:.3f}{title_extra}"
@@ -1020,6 +1202,7 @@ else:
                 st.write("**Schema:**", r.get("schema"))
                 st.write("**Score:**", f"{score:.4f}")
                 st.write("**Match?**", r.get("match"))
+                st.markdown(f"**OS topics:** {topic_chips}")
                 if overlap:
                     st.write("**Name overlap:**", ", ".join(f"`{t}`" for t in overlap))
                 if r.get("datasets"):
@@ -1027,11 +1210,10 @@ else:
                     for d in r["datasets"]:
                         st.write(f"- `{d}`")
             with cols[1]:
-                props = r.get("properties", {})
                 relevant_keys = [
                     "name", "alias", "address", "country", "jurisdiction",
                     "registrationNumber", "swiftBic", "innCode", "ogrnCode",
-                    "topics", "program", "sanctions",
+                    "bikCode", "kppCode", "topics", "program", "sanctions",
                 ]
                 shown = {k: props[k] for k in relevant_keys if k in props}
                 if shown:
