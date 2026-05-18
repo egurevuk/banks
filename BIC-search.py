@@ -427,6 +427,33 @@ def bik_info_lookup(bic: str) -> dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+OPENSANCTIONS_ENTITY_URL = "https://api.opensanctions.org/entities/"
+
+
+def opensanctions_get_entity(api_key: str, entity_id: str) -> dict[str, Any] | None:
+    """Fetch a single entity by its OpenSanctions canonical ID.
+
+    Returns the entity dict, or None if 404 / error. Used to pull the
+    ru_cbr_banks reference record for a Russian BIK (deterministic ID
+    `ru-bik-{BIC}`), which carries OGRN/INN — identifiers that branches
+    share with their parent and that the sanctioned entity also stores.
+    """
+    if not api_key:
+        return None
+    try:
+        r = requests.get(
+            OPENSANCTIONS_ENTITY_URL + entity_id,
+            headers={"Authorization": f"ApiKey {api_key}"},
+            timeout=15,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
 def opensanctions_match(
     api_key: str,
     *,
@@ -531,13 +558,124 @@ def normalize_bic(raw: str) -> str | None:
     return digits
 
 
-def verdict_for_score(score: float) -> tuple[str, str]:
-    """Return (label, color_class) for a match score."""
+# Banking/legal-form words that aren't distinctive on their own. Any token
+# match against these is meaningless ("Bank" matches every bank).
+NAME_STOPWORDS: set[str] = {
+    # Russian legal forms / banking
+    "банк", "банка", "банке", "банков", "банковский", "банковская",
+    "акб", "ткб", "оао", "ооо", "пао", "ао", "зао",
+    "акционерное", "общество", "публичное", "открытое", "закрытое",
+    "коммерческий", "коммерческая", "филиал", "филиала", "отделение",
+    "россии", "россия", "российский", "российская", "российской",
+    "центральный", "центральная", "центрального",
+    "москва", "москвы", "санкт", "петербург",
+    # English / transliterated
+    "bank", "banking", "banks", "branch", "office", "foreign", "trade",
+    "jsc", "pjsc", "ojsc", "cjsc", "oao", "ooo", "pao", "ao",
+    "ltd", "llc", "limited", "company", "co", "corp", "corporation", "group",
+    "joint", "stock", "public", "private", "open", "closed",
+    "filial", "tsentral", "central", "main", "head",
+    "russia", "russian", "moscow", "petersburg", "saint", "st",
+    "publichnoe", "obshchestvo", "obschestvo", "aktsionernoe",
+    "international", "national", "federal",
+    # Articles / common
+    "of", "the", "and", "for", "in", "at", "to", "by",
+    "и", "или", "и/или", "по",
+}
+
+
+def tokenize_name(s: str | None) -> set[str]:
+    """Tokenize a bank name into distinctive tokens (lowercase, 3+ chars, non-stopword)."""
+    if not s:
+        return set()
+    words = re.findall(r"\w+", s.lower())
+    return {w for w in words if len(w) >= 3 and w not in NAME_STOPWORDS}
+
+
+def extract_parent_bank_names(branch_name: str | None) -> list[str]:
+    """Pull parent bank name from Russian branch-naming patterns.
+
+    Examples:
+        'Филиал "Центральный" Банка ВТБ (ПАО)' → ['ВТБ']
+        'ФИЛИАЛ ЦЕНТРАЛЬНЫЙ БАНКА ВТБ (ПАО)' → ['ВТБ']
+        'Filial Tsentral\\'nyj Banka VTB (PAO)' → ['VTB']
+
+    The pattern is `Банка X` / `Банк "X"` (Russian) or `Bank[a] X` (transliterated),
+    capturing the next 1-2 distinctive tokens that aren't stopwords.
+    """
+    if not branch_name:
+        return []
+    out: list[str] = []
+    # Russian: Банка X  (genitive — "of Bank X"). Case-insensitive so ALL-CAPS works.
+    for m in re.finditer(
+        r"\bбанк[ауие]?\s+[\"«'\u201c]?([\u0410-\u042f\u0430-\u044f][\u0410-\u042f\u0430-\u044f\w-]{1,30})[\"»'\u201d]?",
+        branch_name,
+        flags=re.IGNORECASE,
+    ):
+        token = m.group(1).strip()
+        if token and token.lower() not in NAME_STOPWORDS:
+            out.append(token)
+    # Russian: Банк "X" (quoted name)
+    for m in re.finditer(
+        r"\bбанк\s+[\"«'\u201c]([^\"»'\u201d]{2,40})[\"»'\u201d]",
+        branch_name,
+        flags=re.IGNORECASE,
+    ):
+        token = m.group(1).strip()
+        if token and token.lower() not in NAME_STOPWORDS:
+            out.append(token)
+    # English/transliterated: Bank[a] X
+    for m in re.finditer(
+        r"\bbank[ai]?\s+[\"'\u201c]?([A-Za-z][A-Za-z0-9-]{1,30})[\"'\u201d]?",
+        branch_name,
+        flags=re.IGNORECASE,
+    ):
+        token = m.group(1).strip()
+        if token and token.lower() not in NAME_STOPWORDS:
+            out.append(token)
+    return list(dict.fromkeys(out))
+
+
+def name_token_overlap(input_names: list[str], candidate_props: dict) -> list[str]:
+    """Compute distinctive-token overlap between input and a candidate's names.
+
+    The candidate has many name fields (name, alias, previousName, weakAlias).
+    We tokenize them all + the input names, filter stopwords, and intersect.
+    A non-empty result means there's a distinctive bank name token they share —
+    a strong signal even when fuzzy name scoring is unimpressed.
+    """
+    candidate_names: list[str] = []
+    for key in ("name", "alias", "previousName", "weakAlias"):
+        v = candidate_props.get(key)
+        if not v:
+            continue
+        candidate_names.extend(v if isinstance(v, list) else [v])
+
+    input_tokens: set[str] = set()
+    for n in input_names:
+        input_tokens |= tokenize_name(n)
+
+    candidate_tokens: set[str] = set()
+    for n in candidate_names:
+        candidate_tokens |= tokenize_name(n)
+
+    return sorted(input_tokens & candidate_tokens)
+
+
+def compute_verdict(score: float, token_overlap: list[str]) -> tuple[str, str, str]:
+    """(label, emoji, reason) for a single candidate. Score and token overlap
+    are independent signals — token overlap can escalate verdict on its own."""
     if score >= SCORE_HIT:
-        return "MATCH", "🔴"
+        return ("MATCH", "🔴", f"score {score:.2f} ≥ {SCORE_HIT:.2f}")
     if score >= SCORE_REVIEW:
-        return "REVIEW", "🟡"
-    return "LIKELY CLEAR", "🟢"
+        return ("REVIEW", "🟡", f"score {score:.2f} ≥ {SCORE_REVIEW:.2f}")
+    if token_overlap:
+        return (
+            "REVIEW",
+            "🟡",
+            f"name token overlap: {', '.join(token_overlap)} (score {score:.2f} alone is below review)",
+        )
+    return ("LIKELY CLEAR", "🟢", f"score {score:.2f}, no name overlap")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -726,40 +864,101 @@ with st.status("Step 2 · bik-info.ru: bank name & address + transliteration", e
 
 # ─── STEP 3 ──────────────────────────────────────────────────────────────────
 with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as status:
-    # Pull every name variant from both sources, RU + transliterated
+    # Pre-step: pull the ru_cbr_banks reference entity from OpenSanctions for
+    # this BIC. Branches share OGRN/INN with their parent legal entity, so
+    # even when CBR's SOAP API can't resolve a branch BIC, OS's own copy of
+    # the Russian banking registry gives us the parent identifiers directly.
+    enrichment_props: dict[str, list[str]] = {}
+    enrichment_source = None
+    os_ref = opensanctions_get_entity(OPENSANCTIONS_API_KEY, f"ru-bik-{bic}")
+    if os_ref and isinstance(os_ref, dict) and "properties" in os_ref:
+        enrichment_props = os_ref.get("properties") or {}
+        enrichment_source = f"ru-bik-{bic}"
+        st.success(
+            f"✓ Found OpenSanctions reference entity `{enrichment_source}` "
+            f"({os_ref.get('caption') or 'unnamed'}) — enriching query with its identifiers"
+        )
+    else:
+        st.caption(f"(no `ru-bik-{bic}` reference entity in OpenSanctions — using CBR + bik-info.ru only)")
+
+    # Pull every name variant from all sources, RU + transliterated
     name_pool: set[str] = set()
     name_pool.update([name_ru, short_name_ru, name_en, short_name_en])
     for n in (cbr.get("short_names_cbr") or []) + (cbr.get("full_names_cbr") or []):
         name_pool.add(n)
         name_pool.add(transliterate_ru(n))
+    # OS reference entity names — these often include the parent's canonical name
+    for n in enrichment_props.get("name") or []:
+        name_pool.add(n)
+        name_pool.add(transliterate_ru(n))
+
+    # Extract parent bank name from branch-naming patterns
+    # ("Филиал X Банка Y" → "Y"). This is a massive score booster for branches
+    # — without it, fuzzy name matching only sees the branch's full noun phrase
+    # ("Filial Tsentral'nyj Banka VTB PAO") vs the parent's primary name ("VTB BANK OAO"),
+    # which only share one distinctive token after stopword removal.
+    parent_names: set[str] = set()
+    for source_name in [name_ru, short_name_ru, name_en, short_name_en] + (cbr.get("short_names_cbr") or []) + (cbr.get("full_names_cbr") or []):
+        for p in extract_parent_bank_names(source_name):
+            parent_names.add(p)
+            parent_names.add(transliterate_ru(p))
+    if parent_names:
+        st.caption(
+            f"📛 Extracted parent bank name(s) from branch name: "
+            + ", ".join(f"`{p}`" for p in sorted(parent_names))
+        )
+        name_pool |= parent_names
+
     names = [n for n in name_pool if n]
 
-    # Every address variant from both sources, RU + transliterated
+    # Every address variant from all sources, RU + transliterated
     addr_pool: set[str] = set()
     addr_pool.update([address_ru, address_en])
     for a in (cbr.get("addresses_cbr") or []):
         addr_pool.add(a)
         addr_pool.add(transliterate_ru(a))
+    for a in enrichment_props.get("address") or []:
+        addr_pool.add(a)
     addresses = [a for a in addr_pool if a]
 
-    # Prefer bik-info.ru's INN/OGRN, fall back to CBR XML
-    inn_final = inn or cbr.get("inn_cbr")
-    ogrn_final = bi.get("ogrn") or cbr.get("ogrn_cbr")
-    reg_final = cbr.get("regn_cbr")  # bank license number (e.g. "2673")
+    # Identifiers: prefer existing sources, fall back to OS reference enrichment
+    inn_final = inn or cbr.get("inn_cbr") or (enrichment_props.get("innCode") or [None])[0]
+    ogrn_final = (
+        bi.get("ogrn")
+        or cbr.get("ogrn_cbr")
+        or (enrichment_props.get("ogrnCode") or [None])[0]
+    )
+    reg_final = cbr.get("regn_cbr") or (enrichment_props.get("registrationNumber") or [None])[0]
 
-    # Pass ALL BIKs and KPPs (head office + branches) — OpenSanctions typically
-    # only stores the head-office BIK, so the user's input branch BIC alone
-    # would miss the match.
-    all_bics = cbr.get("bik_codes") or [bic]
-    if bic not in all_bics:
-        all_bics = [bic] + all_bics
-    all_kpps = cbr.get("kpp_codes_cbr") or ([kpp] if kpp else [])
+    # Pass ALL BIKs and KPPs (head office + branches + anything OS has on file)
+    bik_pool: set[str] = set([bic])
+    bik_pool.update(cbr.get("bik_codes") or [])
+    bik_pool.update(enrichment_props.get("bikCode") or [])
+    all_bics = sorted(bik_pool)
+
+    kpp_pool: set[str] = set()
+    kpp_pool.update(cbr.get("kpp_codes_cbr") or [])
+    if kpp:
+        kpp_pool.add(kpp)
+    kpp_pool.update(enrichment_props.get("kppCode") or [])
+    all_kpps = sorted(kpp_pool)
+
+    # SWIFTs: combine CBR-extracted + any in the OS reference entity
+    swift_pool: set[str] = set(cbr.get("swift_codes") or [])
+    for s in enrichment_props.get("swiftBic") or []:
+        swift_pool.add(s.upper())
+        # Also synthesize the alternate length so both forms reach the matcher
+        if len(s) == 8:
+            swift_pool.add(s.upper() + "XXX")
+        elif len(s) == 11:
+            swift_pool.add(s[:8].upper())
+    all_swifts = sorted(swift_pool)
 
     os_result = opensanctions_match(
         OPENSANCTIONS_API_KEY,
         names=names,
         addresses=addresses,
-        swift_codes=cbr.get("swift_codes", []),
+        swift_codes=all_swifts,
         bik_codes=all_bics,
         inn=inn_final,
         ogrn=ogrn_final,
@@ -784,26 +983,49 @@ st.markdown("## Step 4 · Verdict")
 if not results:
     st.success("🟢 **No matches in OpenSanctions** — no candidate entities returned for this bank.")
 else:
-    top_score = max((r.get("score") or 0) for r in results)
-    label, emoji = verdict_for_score(top_score)
-    if label == "MATCH":
-        st.error(f"{emoji} **{label}** — top score {top_score:.2f}. Investigate before transacting.")
-    elif label == "REVIEW":
-        st.warning(f"{emoji} **{label}** — top score {top_score:.2f}. Manual review recommended.")
+    # Compute per-candidate verdicts using both score and name-token overlap
+    candidate_verdicts = []
+    for r in results:
+        score = r.get("score") or 0
+        props = r.get("properties", {})
+        overlap = name_token_overlap(names, props)
+        label, emoji, reason = compute_verdict(score, overlap)
+        candidate_verdicts.append((r, score, overlap, label, emoji, reason))
+
+    # Overall verdict = worst (most severe) of all candidates
+    severity = {"MATCH": 3, "REVIEW": 2, "LIKELY CLEAR": 1}
+    candidate_verdicts.sort(key=lambda t: (severity[t[3]], t[1]), reverse=True)
+    _, top_score, top_overlap, top_label, top_emoji, top_reason = candidate_verdicts[0]
+
+    if top_label == "MATCH":
+        st.error(
+            f"{top_emoji} **{top_label}** — {top_reason}. Investigate before transacting."
+        )
+    elif top_label == "REVIEW":
+        st.warning(
+            f"{top_emoji} **{top_label}** — {top_reason}. Manual review required."
+        )
     else:
-        st.success(f"{emoji} **{label}** — top score {top_score:.2f}. Likely false positive.")
+        st.success(
+            f"{top_emoji} **{top_label}** — {top_reason}. Likely false positive."
+        )
 
     st.markdown("### Candidates")
-    for r in sorted(results, key=lambda x: x.get("score") or 0, reverse=True):
-        score = r.get("score") or 0
-        _, emoji = verdict_for_score(score)
-        with st.expander(f"{emoji}  {r.get('caption', '(no caption)')}  ·  score {score:.3f}"):
+    for r, score, overlap, label, emoji, reason in candidate_verdicts:
+        title_extra = f" · 🔗 overlap: {', '.join(overlap)}" if overlap else ""
+        with st.expander(
+            f"{emoji}  {r.get('caption', '(no caption)')}  ·  score {score:.3f}{title_extra}"
+        ):
             cols = st.columns([1, 2])
             with cols[0]:
+                st.write("**Verdict:**", f"{emoji} {label}")
+                st.write("**Reason:**", reason)
                 st.write("**ID:**", r.get("id"))
                 st.write("**Schema:**", r.get("schema"))
                 st.write("**Score:**", f"{score:.4f}")
                 st.write("**Match?**", r.get("match"))
+                if overlap:
+                    st.write("**Name overlap:**", ", ".join(f"`{t}`" for t in overlap))
                 if r.get("datasets"):
                     st.write("**Datasets:**")
                     for d in r["datasets"]:
