@@ -108,16 +108,30 @@ def internal_code_to_credit_info(int_code: int) -> ET.Element | None:
 
 
 def extract_swift_codes(credit_info: ET.Element) -> list[str]:
-    """Walk the embedded CBR XML and pull out all <SWBIC SWBIC="..."/> values."""
-    swifts: list[str] = []
+    """Walk the embedded CBR XML and pull out all <SWBIC SWBIC="..."/> values.
+
+    Returns every form we have evidence for: 11-char raw + 8-char institutional
+    (drop the branch suffix). OpenSanctions stores SWIFTs in 8-char canonical
+    form, so we must include that form for the identifier match to score.
+    """
+    raw: list[str] = []
     for el in credit_info.iter():
         tag = el.tag.rsplit("}", 1)[-1]
         if tag.upper() == "SWBIC":
             code = el.attrib.get("SWBIC") or el.attrib.get("Swbic") or el.text
             if code and code.strip():
-                swifts.append(code.strip())
-    # dedupe, preserve order
-    return list(dict.fromkeys(swifts))
+                raw.append(code.strip().upper())
+
+    expanded: list[str] = []
+    for code in raw:
+        expanded.append(code)
+        # If 11 chars, also emit the 8-char institutional BIC
+        if len(code) == 11:
+            expanded.append(code[:8])
+        # If 8 chars, also emit the canonical XXX-suffixed form
+        elif len(code) == 8:
+            expanded.append(code + "XXX")
+    return list(dict.fromkeys(expanded))  # dedupe, preserve order
 
 
 def cbr_lookup(bic: str) -> dict[str, Any]:
@@ -141,12 +155,19 @@ def cbr_lookup(bic: str) -> dict[str, Any]:
 
     swifts = extract_swift_codes(credit_info)
 
-    # Pull short/full names from XML if present (useful debugging)
+    # Pull every identifier and the names from CBR XML.
+    # CBR uses these attribute names across various nested elements:
+    #   NameP, ShortName       — short/branded name (e.g. "ТБанк")
+    #   NameMaxP, FullName     — full legal name
+    #   Ind_INN / INN          — INN
+    #   OGRN                   — OGRN
+    #   RegN, RegNumber        — bank license / registration number (e.g. "2673")
+    #   Adr, Address, AddrFakt — registered address (Russian)
     def _first_attr(*names: str) -> str | None:
         for el in credit_info.iter():
             for n in names:
-                if n in el.attrib:
-                    return el.attrib[n]
+                if n in el.attrib and el.attrib[n].strip():
+                    return el.attrib[n].strip()
         return None
 
     return {
@@ -155,6 +176,10 @@ def cbr_lookup(bic: str) -> dict[str, Any]:
         "primary_swift": swifts[0] if swifts else None,
         "short_name_cbr": _first_attr("ShortName", "NameP"),
         "full_name_cbr": _first_attr("FullName", "NameMaxP"),
+        "inn_cbr": _first_attr("Ind_INN", "INN"),
+        "ogrn_cbr": _first_attr("OGRN"),
+        "regn_cbr": _first_attr("RegN", "RegNumber"),
+        "address_cbr": _first_attr("Adr", "Address", "AddrFakt"),
     }
 
 
@@ -206,27 +231,37 @@ def opensanctions_match(
     bic: str,
     inn: str | None = None,
     ogrn: str | None = None,
+    reg_number: str | None = None,
+    cutoff: float = 0.35,
 ) -> dict[str, Any]:
-    """Query OpenSanctions /match/default with all available identifiers."""
+    """Query OpenSanctions /match/default with semantic identifier properties.
+
+    Why semantic property names matter: OpenSanctions' matcher scores each
+    identifier type separately (swiftBic, bikCode, innCode, ogrnCode are all
+    type `identifier` but with their own matchers). Stuffing the BIC into
+    `registrationNumber` works as a fallback but produces weaker scores than
+    putting it in the dedicated `bikCode` slot.
+    """
     if not api_key:
         return {"error": "OpenSanctions API key not configured"}
 
     properties: dict[str, list[str]] = {
-        "name": [n for n in names if n],
+        "name": [n for n in dict.fromkeys(names) if n],
         "jurisdiction": ["Russia"],
         "country": ["Russia"],
     }
     if addresses:
-        properties["address"] = [a for a in addresses if a]
+        properties["address"] = [a for a in dict.fromkeys(addresses) if a]
     if swift_codes:
         properties["swiftBic"] = swift_codes
-    # BIC isn't a SWIFT BIC — put it in registrationNumber as a secondary signal
-    reg_numbers = [bic]
+    # Russian-bank-specific identifiers map to dedicated FtM properties:
+    properties["bikCode"] = [bic]
     if inn:
-        reg_numbers.append(inn)
+        properties["innCode"] = [inn]
     if ogrn:
-        reg_numbers.append(ogrn)
-    properties["registrationNumber"] = reg_numbers
+        properties["ogrnCode"] = [ogrn]
+    if reg_number:
+        properties["registrationNumber"] = [reg_number]
 
     body = {
         "queries": {
@@ -241,7 +276,7 @@ def opensanctions_match(
         r = requests.post(
             OPENSANCTIONS_MATCH_URL,
             json=body,
-            params={"algorithm": "best"},
+            params={"algorithm": "best", "cutoff": str(cutoff)},
             headers={
                 "Authorization": f"ApiKey {api_key}",
                 "Content-Type": "application/json",
@@ -263,6 +298,7 @@ def opensanctions_match(
     return {
         "query": bank_resp.get("query"),
         "results": bank_resp.get("results", []),
+        "sent_properties": properties,
     }
 
 
@@ -406,7 +442,11 @@ with st.status("Step 2 · bik-info.ru: bank name & address + transliteration", e
         st.write(
             {
                 "BIC": bic,
-                "INN": inn,
+                "INN (bik-info)": inn,
+                "INN (CBR)": cbr.get("inn_cbr"),
+                "OGRN (bik-info)": bi.get("ogrn"),
+                "OGRN (CBR)": cbr.get("ogrn_cbr"),
+                "Bank license № (CBR)": cbr.get("regn_cbr"),
                 "KPP": kpp,
                 "Correspondent acct (КС)": ks,
                 "Phone": phone,
@@ -418,8 +458,21 @@ with st.status("Step 2 · bik-info.ru: bank name & address + transliteration", e
 # ─── STEP 3 ──────────────────────────────────────────────────────────────────
 with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as status:
     # Collect every name/address variant we have, in both scripts
-    names = [n for n in {name_ru, short_name_ru, name_en, short_name_en, cbr.get("short_name_cbr"), cbr.get("full_name_cbr")} if n]
-    addresses = [a for a in {address_ru, address_en} if a]
+    names = [
+        n for n in {
+            name_ru, short_name_ru, name_en, short_name_en,
+            cbr.get("short_name_cbr"), cbr.get("full_name_cbr"),
+            transliterate_ru(cbr.get("short_name_cbr")),
+            transliterate_ru(cbr.get("full_name_cbr")),
+        } if n
+    ]
+    cbr_addr = cbr.get("address_cbr")
+    addresses = [a for a in {address_ru, address_en, cbr_addr, transliterate_ru(cbr_addr)} if a]
+
+    # Prefer bik-info.ru's INN/OGRN, fall back to CBR XML
+    inn_final = inn or cbr.get("inn_cbr")
+    ogrn_final = bi.get("ogrn") or cbr.get("ogrn_cbr")
+    reg_final = cbr.get("regn_cbr")  # bank license number (e.g. "2673")
 
     os_result = opensanctions_match(
         OPENSANCTIONS_API_KEY,
@@ -427,8 +480,9 @@ with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as
         addresses=addresses,
         swift_codes=cbr.get("swift_codes", []),
         bic=bic,
-        inn=inn,
-        ogrn=bi.get("ogrn"),
+        inn=inn_final,
+        ogrn=ogrn_final,
+        reg_number=reg_final,
     )
     if os_result.get("error"):
         st.error(os_result["error"])
@@ -438,7 +492,8 @@ with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as
         st.stop()
 
     results = os_result.get("results", [])
-    st.caption(f"Sent query with names={names}, addresses={addresses}, swift={cbr.get('swift_codes')}")
+    with st.expander("Query sent to OpenSanctions"):
+        st.json(os_result.get("sent_properties", {}))
     status.update(label=f"Step 3 · {len(results)} candidate(s) returned", state="complete")
 
 # ─── STEP 4 ──────────────────────────────────────────────────────────────────
