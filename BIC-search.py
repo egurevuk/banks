@@ -302,29 +302,35 @@ def name_variants(name: str) -> list[str]:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def search_opensanctions_by_bik_code(
-    bik: str, api_key: str | None = None
+    bik: str, name: str | None = None, api_key: str | None = None
 ) -> dict[str, Any]:
-    """Search OpenSanctions for an entity with this BIK in its ``bikCode``
-    property — an exact identifier match.
+    """Search OpenSanctions by ``bikCode`` Company property.
 
-    OpenSanctions Company entities carry the Russian BIK in the ``bikCode``
+    OpenSanctions stores Russian bank BIKs in the ``bikCode`` Company
     property (see e.g.
-    https://www.opensanctions.org/statements/NK-bRyPm6xPipVgtWYe6wsPDC/?prop=bikCode).
-    When the BIK is registered against a sanctioned entity, this gives us
-    a 1.00-score exact match — no transliteration, no fuzzy logic.
+    https://www.opensanctions.org/statements/NK-eyGem2AhvVFkniDghv3Vm6/?prop=bikCode
+    for T-Bank's ``044525974``). When the BIK is registered against a
+    sanctioned entity, this gives us a near-1.0 exact match.
 
-    Returns the same shape as :func:`search_opensanctions_by_name` so the
-    pipeline can treat the two paths uniformly.
+    The ``/match`` endpoint requires a ``name`` property — identifier-only
+    queries return empty. We pass the bank name (and its variants) so
+    logic-v2 has something to score, and the identifier match boosts the
+    score on top of name similarity.
     """
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"ApiKey {api_key}"
+
+    # /match requires name; if we don't have one we still try with a
+    # placeholder so the request doesn't get rejected.
+    names = name_variants(name) if name else ["Russian Bank"]
 
     payload = {
         "queries": {
             "q1": {
                 "schema": "Company",
                 "properties": {
+                    "name":    names,
                     "bikCode": [bik],
                     "country": ["ru"],
                 },
@@ -359,22 +365,16 @@ def search_opensanctions_by_bik_code(
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def search_opensanctions_by_swift_bic(
-    swift: str, api_key: str | None = None
+    swift: str, name: str | None = None, api_key: str | None = None
 ) -> dict[str, Any]:
-    """Search OpenSanctions by SWIFT/BIC via the ``swiftBic`` Organization
-    property.
+    """Search OpenSanctions by ``swiftBic`` Organization property.
 
-    SWIFT codes are structured ``AAAA-BB-CC[-XXX]``: the first 4 chars
-    are the bank identifier, next 2 the country, next 2 the location,
-    last 3 the optional branch suffix. When we send the full SWIFT to
-    ``/match``, logic-v2 scores candidates against the ``swiftBic`` field
-    — exact matches score 1.0; matches sharing only the bank+country
-    prefix (e.g. SABRRU2P vs SABRRUMM, both Sberbank but different
-    regional offices) typically score around 0.6–0.8.
+    OpenSanctions stores SWIFT/BIC codes (8-char primary form) on the
+    ``swiftBic`` property. We strip the optional ``XXX`` branch suffix
+    so ``TICSRUMMXXX`` and ``TICSRUMM`` compare equal.
 
-    We pass the 8-char primary-office form (branch suffix stripped, if
-    present) so codes like ``TICSRUMMXXX`` and ``TICSRUMM`` compare
-    equal.
+    Like the bikCode lookup, we also include the bank name because
+    ``/match`` requires it.
     """
     if not swift:
         return {"ok": True, "error": None, "results": [], "swift_query": None}
@@ -388,11 +388,14 @@ def search_opensanctions_by_swift_bic(
     if api_key:
         headers["Authorization"] = f"ApiKey {api_key}"
 
+    names = name_variants(name) if name else ["Russian Bank"]
+
     payload = {
         "queries": {
             "q1": {
                 "schema": "Organization",
                 "properties": {
+                    "name":     names,
                     "swiftBic": [normalized],
                     "country":  ["ru"],
                 },
@@ -603,10 +606,21 @@ def is_valid_bik(bik: str) -> bool:
 def _has_sanction_signal(candidate: dict) -> bool:
     """Cheap pre-check: does this /match candidate look sanctioned?
 
-    Uses topic + dataset info already returned by /match so we don't have
-    to hydrate every candidate just to decide.
+    Checks two signals exposed by /match results:
+    * ``properties.topics`` (the standard location) — OpenSanctions uses
+      ``sanction``, ``sanction.linked``, ``role.pep``, ``crime``, etc.
+    * ``datasets`` — top-level array of dataset names. We treat the
+      candidate as sanctioned if any of its datasets is itself a
+      sanctioning list (us_ofac_sdn, eu_fsf, gb_hmt_sanctions, …).
+
+    Falls back to top-level ``topics`` for shape variance, though /match
+    always nests it under ``properties``.
     """
-    topics = candidate.get("topics") or []
+    topics = (
+        candidate.get("properties", {}).get("topics")
+        or candidate.get("topics")
+        or []
+    )
     if any(isinstance(t, str) and t.startswith("sanction")
            and t != "sanction.linked" for t in topics):
         return True
@@ -696,9 +710,12 @@ def screen(bik: str, api_key: str | None) -> dict[str, Any]:
 
     name = info["name"]
     swift = info.get("swift")
+    api_errors: list[str] = []
 
-    # ---- Step 2: exact-identifier search via bikCode property ---------
-    bik_match = search_opensanctions_by_bik_code(bik, api_key=api_key)
+    # ---- Step 2: bikCode lookup (exact identifier) -------------------
+    bik_match = search_opensanctions_by_bik_code(bik, name=name, api_key=api_key)
+    if not bik_match.get("ok"):
+        api_errors.append(bik_match.get("error", "bikCode lookup failed"))
     bik_results = bik_match.get("results") or []
     bik_candidate = _pick_best_candidate(bik_results) if bik_results else None
 
@@ -718,6 +735,9 @@ def screen(bik: str, api_key: str | None) -> dict[str, Any]:
             "matched_via": "bikCode",
             "variants_used": [],
             "swift_query": None,
+            "api_errors": api_errors,
+            "bik_results": bik_results,
+            "swift_results": [],
         }
 
     # ---- Step 3: SWIFT-based search via swiftBic property ------------
@@ -725,7 +745,11 @@ def screen(bik: str, api_key: str | None) -> dict[str, Any]:
     swift_query: str | None = None
     swift_candidate: dict | None = None
     if swift:
-        swift_match = search_opensanctions_by_swift_bic(swift, api_key=api_key)
+        swift_match = search_opensanctions_by_swift_bic(
+            swift, name=name, api_key=api_key
+        )
+        if not swift_match.get("ok"):
+            api_errors.append(swift_match.get("error", "swiftBic lookup failed"))
         swift_results = swift_match.get("results") or []
         swift_query = swift_match.get("swift_query")
         swift_candidate = _pick_best_swift_candidate(swift_results)
@@ -734,7 +758,9 @@ def screen(bik: str, api_key: str | None) -> dict[str, Any]:
     name_match = search_opensanctions_by_name(name, api_key=api_key)
     if not name_match["ok"]:
         return {"step": "match", "bik": bik, "name": name,
-                "swift": swift, "raw_bik_info": info["raw"], **name_match}
+                "swift": swift, "raw_bik_info": info["raw"],
+                "api_errors": api_errors + [name_match.get("error", "")],
+                **name_match}
     name_results = name_match["results"]
     variants_used = name_match.get("variants_used", [])
     name_candidate = _pick_best_candidate(name_results) if name_results else None
@@ -780,6 +806,8 @@ def screen(bik: str, api_key: str | None) -> dict[str, Any]:
         "variants_used": variants_used,
         "swift_query":   swift_query,
         "swift_results": swift_results,
+        "bik_results":   bik_results,
+        "api_errors":    api_errors,
     }
 
 
@@ -996,9 +1024,59 @@ if run:
                 f"[Open canonical entity page ↗]({os_url})"
             )
 
+    # --- Surface any API errors prominently --------------------------------
+    api_errors = result.get("api_errors") or []
+    if api_errors:
+        st.error(
+            "⚠️ Some OpenSanctions lookups failed — verdict may be incomplete:"
+        )
+        for err in api_errors:
+            st.markdown(f"- {err}")
+
     # --- Diagnostic details -------------------------------------------------
     with st.expander("Raw bik-info.ru response"):
         st.json(result["raw_bik_info"])
+
+    if result.get("swift_query"):
+        with st.expander(
+            f"`swiftBic` lookup → {len(result.get('swift_results') or [])} "
+            f"candidates  (query: `{result['swift_query']}`)"
+        ):
+            sresults = result.get("swift_results") or []
+            if not sresults:
+                st.markdown("_No candidates returned._")
+            for r in sresults:
+                topics = r.get("properties", {}).get("topics") or r.get("topics") or []
+                st.markdown(
+                    f"**{r.get('caption', '?')}** — score "
+                    f"`{r.get('score', 0):.2f}` "
+                    f"{'✅' if r.get('match') else '—'}  "
+                    f"{'❌ sanctioned' if _has_sanction_signal(r) else '✓ clean'}"
+                )
+                st.caption(
+                    f"ID: `{r.get('id')}` · topics: {topics} · "
+                    f"datasets: {(r.get('datasets') or [])[:5]}"
+                )
+
+    if result.get("bik_results") is not None:
+        bik_results = result.get("bik_results") or []
+        with st.expander(
+            f"`bikCode` lookup → {len(bik_results)} candidates"
+        ):
+            if not bik_results:
+                st.markdown("_No candidates returned._")
+            for r in bik_results:
+                topics = r.get("properties", {}).get("topics") or r.get("topics") or []
+                st.markdown(
+                    f"**{r.get('caption', '?')}** — score "
+                    f"`{r.get('score', 0):.2f}` "
+                    f"{'✅' if r.get('match') else '—'}  "
+                    f"{'❌ sanctioned' if _has_sanction_signal(r) else '✓ clean'}"
+                )
+                st.caption(
+                    f"ID: `{r.get('id')}` · topics: {topics} · "
+                    f"datasets: {(r.get('datasets') or [])[:5]}"
+                )
 
     variants = result.get("variants_used") or []
     if variants:
