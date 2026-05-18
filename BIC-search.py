@@ -144,29 +144,173 @@ def lookup_bik(bik: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Cyrillic → Latin transliteration
+# ---------------------------------------------------------------------------
+#
+# bik-info.ru returns bank names in Cyrillic (e.g. "ПАО СБЕРБАНК"), but
+# OpenSanctions stores most Russian-bank canonicals in English form
+# (e.g. "Joint Stock Company Sberbank"). OpenSanctions' logic-v2 matcher
+# does fuzzy comparison but performs much better when the candidate name
+# is also in Latin script — so we ship both the original Cyrillic name
+# AND a transliteration to /match.
+#
+# We use BGN/PCGN-style mapping (the scheme used in most international
+# sanctions documents). It isn't perfect for every name — e.g. "Ц" → "Ts"
+# whereas Center-Invest brands itself "Center-Invest" not "Tsentr-Invest" —
+# but /match's fuzzy scoring handles the residual mismatch via token
+# overlap on the parts that DO transliterate cleanly (BANK, SBERBANK,
+# INVEST, etc.).
+
+_CYR_TO_LAT_LOWER: dict[str, str] = {
+    "а": "a",  "б": "b",  "в": "v",  "г": "g",  "д": "d",  "е": "e",
+    "ё": "yo", "ж": "zh", "з": "z",  "и": "i",  "й": "y",  "к": "k",
+    "л": "l",  "м": "m",  "н": "n",  "о": "o",  "п": "p",  "р": "r",
+    "с": "s",  "т": "t",  "у": "u",  "ф": "f",  "х": "kh", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "shch", "ъ": "", "ы": "y", "ь": "",
+    "э": "e",  "ю": "yu", "я": "ya",
+}
+
+# Common legal-form prefixes worth stripping when we generate name
+# variants — these tokens carry no entity-identifying value and only
+# dilute the name match.
+_LEGAL_FORMS_CYR = ("ПАО ", "АО ", "ООО ", "ОАО ", "ЗАО ", "АКБ ", "КБ ",
+                    "НКО ", "РНКО ", "ИКБ ", "ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО ")
+_LEGAL_FORMS_LAT = ("PAO ", "AO ", "OOO ", "OAO ", "ZAO ", "AKB ", "KB ",
+                    "NKO ", "RNKO ", "IKB ", "PJSC ", "JSC ", "LLC ",
+                    "PUBLIC JOINT STOCK COMPANY ")
+
+# Map Cyrillic legal forms to their conventional English equivalents so
+# we can add anglicized variants alongside the strict transliteration.
+_LEGAL_FORM_ENGLISH = {
+    "ПАО":  "PJSC",
+    "ОАО":  "OJSC",
+    "АО":   "JSC",
+    "ЗАО":  "CJSC",
+    "ООО":  "LLC",
+    "АКБ":  "JSCB",   # joint-stock commercial bank
+    "КБ":   "CB",     # commercial bank
+    "НКО":  "NCO",    # non-bank credit organization
+    "РНКО": "RNCO",
+}
+
+
+def transliterate(text: str) -> str:
+    """Transliterate Cyrillic to Latin (BGN/PCGN-style), case-preserving."""
+    if not text:
+        return ""
+    out: list[str] = []
+    for ch in text:
+        lower = ch.lower()
+        if lower in _CYR_TO_LAT_LOWER:
+            mapped = _CYR_TO_LAT_LOWER[lower]
+            if ch.isupper() and mapped:
+                # Uppercase the whole digraph for ALL-CAPS context.
+                # We approximate this by using upper() — gives "SHCH" for "Щ",
+                # which is what international docs use.
+                mapped = mapped.upper()
+            out.append(mapped)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def name_variants(name: str) -> list[str]:
+    """Generate a deduplicated list of name forms for OpenSanctions /match.
+
+    Includes:
+    * The original name (verbatim).
+    * BGN/PCGN transliteration of the original.
+    * The original with leading legal-form prefix stripped (e.g. drops "ПАО ").
+    * Transliteration of the stripped form.
+    * Anglicized abbreviation variants (e.g. "ПАО СБЕРБАНК" → "PJSC SBERBANK").
+
+    Order is preserved (best-match-first), with the original name first.
+    """
+    if not name:
+        return []
+    seen: set[str] = set()
+    variants: list[str] = []
+
+    def add(v: str) -> None:
+        v = v.strip()
+        if not v:
+            return
+        key = v.upper()
+        if key in seen:
+            return
+        seen.add(key)
+        variants.append(v)
+
+    add(name)
+    add(transliterate(name))
+
+    upper = name.upper()
+    # Strip a leading Cyrillic legal-form prefix
+    for prefix in _LEGAL_FORMS_CYR:
+        if upper.startswith(prefix):
+            stripped = name[len(prefix):].strip()
+            add(stripped)
+            add(transliterate(stripped))
+            # Anglicized legal-form prefix
+            cyr_form = prefix.strip()
+            english = _LEGAL_FORM_ENGLISH.get(cyr_form)
+            if english:
+                add(f"{english} {transliterate(stripped)}")
+            break
+
+    # Also handle the case where it starts with the Latin abbreviation
+    # already (some banks return mixed-script names)
+    for prefix in _LEGAL_FORMS_LAT:
+        if upper.startswith(prefix):
+            stripped = name[len(prefix):].strip()
+            add(stripped)
+            add(transliterate(stripped))
+            break
+
+    # Find a legal-form marker ANYWHERE in the name (not just the start).
+    # Russian branch names commonly have the pattern
+    # "<region descriptor> <legal form> <parent bank>", e.g.
+    # "СЕВЕРО-ЗАПАДНЫЙ БАНК ПАО СБЕРБАНК" — the part after ПАО is the
+    # parent we want to surface for matching.
+    tokens = name.split()
+    upper_tokens = [t.upper().strip(",.") for t in tokens]
+    marker_set = {p.strip() for p in _LEGAL_FORMS_CYR} | \
+                 {p.strip() for p in _LEGAL_FORMS_LAT}
+    for i, tok in enumerate(upper_tokens):
+        if tok in marker_set and i + 1 < len(tokens):
+            tail = " ".join(tokens[i + 1:]).strip()
+            if tail and tail.upper() != name.upper():
+                add(tail)
+                add(transliterate(tail))
+
+    return variants
+
+
+# ---------------------------------------------------------------------------
 # Step 2 — OpenSanctions search by name
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def search_opensanctions(name: str, api_key: str | None = None) -> dict[str, Any]:
-    """Search OpenSanctions for a bank by name.
+    """Search OpenSanctions for a bank by name (multi-variant fuzzy match).
 
-    Uses POST ``/match/sanctions`` with a Company-schema query carrying
-    just the name and ``country=ru`` — this is OpenSanctions' recommended
-    endpoint for screening and gives logic-v2 fuzzy-match scores rather
-    than the brittle text-search of ``/search``. Returns the parsed JSON
-    response or an error dict.
+    We ship the original Cyrillic name AND its Latin transliteration AND
+    legal-form-stripped variants to ``POST /match/sanctions``. This gives
+    the logic-v2 matcher enough script + abbreviation coverage to find
+    Russian-bank canonicals that are stored in English form (e.g.
+    "Joint Stock Company Sberbank" for "ПАО СБЕРБАНК").
     """
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"ApiKey {api_key}"
 
+    variants = name_variants(name)
     payload = {
         "queries": {
             "q1": {
                 "schema": "Company",
                 "properties": {
-                    "name":         [name],
+                    "name":         variants,
                     "country":      ["ru"],
                     "jurisdiction": ["Russia"],
                 },
@@ -183,20 +327,21 @@ def search_opensanctions(name: str, api_key: str | None = None) -> dict[str, Any
         resp.raise_for_status()
     except requests.RequestException as exc:
         return {"ok": False, "error": f"OpenSanctions request failed: {exc}",
-                "results": []}
+                "results": [], "variants_used": variants}
 
     try:
         data = resp.json()
     except ValueError:
         return {"ok": False, "error": "OpenSanctions returned non-JSON",
-                "results": []}
+                "results": [], "variants_used": variants}
 
     results = (
         data.get("responses", {})
         .get("q1", {})
         .get("results", [])
     ) or []
-    return {"ok": True, "error": None, "results": results}
+    return {"ok": True, "error": None, "results": results,
+            "variants_used": variants}
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -317,6 +462,58 @@ def is_valid_bik(bik: str) -> bool:
     return bool(bik) and bik.isdigit() and len(bik) == 9
 
 
+def _has_sanction_signal(candidate: dict) -> bool:
+    """Cheap pre-check: does this /match candidate look sanctioned?
+
+    Uses topic + dataset info already returned by /match so we don't have
+    to hydrate every candidate just to decide.
+    """
+    topics = candidate.get("topics") or []
+    if any(isinstance(t, str) and t.startswith("sanction")
+           and t != "sanction.linked" for t in topics):
+        return True
+    for ds in candidate.get("datasets") or []:
+        if _country_from_dataset(ds):
+            return True
+    return False
+
+
+# Score thresholds for the verdict ladder. logic-v2 returns scores in
+# [0, 1]; the `match` flag is set when score clears its internal
+# threshold (≈ 0.7). We're more lenient because cross-script names rarely
+# clear it cleanly:
+#   ≥ 0.70 → strong match (high confidence)
+#   ≥ 0.50 → possible match (review-worthy)
+#   <  0.50 → too weak to call
+MATCH_STRONG = 0.70
+MATCH_POSSIBLE = 0.50
+
+
+def _pick_best_candidate(results: list[dict]) -> dict | None:
+    """From a list of /match candidates, return the one that best
+    answers "is this bank sanctioned?".
+
+    Strategy:
+    1. Prefer the highest-scoring SANCTIONED candidate above
+       MATCH_POSSIBLE — even if the matcher flagged it as match=False,
+       a 0.6-score Sberbank hit on "СБЕРБАНК" beats a 0.95-score clean
+       bank with a coincidentally similar name.
+    2. If no sanctioned candidate clears MATCH_POSSIBLE, fall back to
+       the highest-scoring overall candidate so the UI can still show
+       what was looked at.
+    """
+    if not results:
+        return None
+    sanctioned = [r for r in results
+                  if _has_sanction_signal(r)
+                  and r.get("score", 0) >= MATCH_POSSIBLE]
+    sanctioned.sort(key=lambda r: r.get("score", 0), reverse=True)
+    if sanctioned:
+        return sanctioned[0]
+    # No usable sanctioned hit — return the top-overall for display
+    return max(results, key=lambda r: r.get("score", 0))
+
+
 def screen(bik: str, api_key: str | None) -> dict[str, Any]:
     """Full pipeline: bik-info → OpenSanctions /match → enriched entity."""
     info = lookup_bik(bik)
@@ -330,10 +527,7 @@ def screen(bik: str, api_key: str | None) -> dict[str, Any]:
                 "raw_bik_info": info["raw"], **match}
 
     results = match["results"]
-    # Pick the best confirmed match, if any. logic-v2 sets match=True only
-    # when the candidate clears its similarity threshold.
-    confirmed = [r for r in results if r.get("match")]
-    candidate = confirmed[0] if confirmed else (results[0] if results else None)
+    candidate = _pick_best_candidate(results)
 
     enriched = None
     if candidate and candidate.get("id"):
@@ -348,6 +542,7 @@ def screen(bik: str, api_key: str | None) -> dict[str, Any]:
         "results": results,
         "candidate": candidate,
         "enriched": enriched,
+        "variants_used": match.get("variants_used", []),
     }
 
 
@@ -434,29 +629,28 @@ if run:
             "Japan, Australia, Ukraine, and more."
         )
     else:
-        # We have a candidate. Was it confirmed?
-        confirmed = bool(candidate.get("match"))
         target_entity = enriched or candidate
         sanctioned = is_sanctioned(target_entity)
+        score = candidate.get("score", 0.0)
 
-        if sanctioned and confirmed:
+        if sanctioned and score >= MATCH_STRONG:
             st.markdown(
                 '<div style="background:#dc2626;color:white;padding:12px 16px;'
                 'border-radius:8px;font-weight:600;font-size:1.1rem;'
                 'display:inline-block;">❌ SANCTIONED</div>',
                 unsafe_allow_html=True,
             )
-        elif sanctioned and not confirmed:
+        elif sanctioned and score >= MATCH_POSSIBLE:
             st.markdown(
                 '<div style="background:#f59e0b;color:white;padding:12px 16px;'
                 'border-radius:8px;font-weight:600;font-size:1.1rem;'
-                'display:inline-block;">⚠️ POSSIBLE MATCH — REVIEW</div>',
+                'display:inline-block;">⚠️ LIKELY SANCTIONED — REVIEW</div>',
                 unsafe_allow_html=True,
             )
             st.caption(
-                "OpenSanctions returned a sanctioned entity with a name "
-                "similar to this bank, but the automatic matcher wasn't "
-                "confident. Inspect the candidate below."
+                "A sanctioned entity matched this bank's name with moderate "
+                "confidence. Cross-script name comparison rarely hits the "
+                "matcher's strict threshold — inspect the candidate below."
             )
         else:
             st.success("✅ **CLEAR** — best match isn't on a sanctions list")
@@ -466,14 +660,12 @@ if run:
             f"**Matched OpenSanctions entity:** "
             f"{target_entity.get('caption', '—')}"
         )
-        score = candidate.get("score")
-        if score is not None:
-            st.caption(
-                f"Match score: {score:.2f} "
-                f"({'confirmed' if confirmed else 'below confidence threshold'})"
-            )
+        st.caption(
+            f"Match score: {score:.2f} "
+            f"({'confirmed' if candidate.get('match') else 'fuzzy'})"
+        )
 
-        if sanctioned:
+        if sanctioned and score >= MATCH_POSSIBLE:
             countries = extract_sanction_countries(target_entity)
             if countries:
                 st.markdown("### Sanctioning jurisdictions")
@@ -492,6 +684,12 @@ if run:
     with st.expander("Raw bik-info.ru response"):
         st.json(result["raw_bik_info"])
 
+    variants = result.get("variants_used") or []
+    if variants:
+        with st.expander(f"Name variants sent to OpenSanctions ({len(variants)})"):
+            for v in variants:
+                st.markdown(f"- `{v}`")
+
     if result.get("results"):
         with st.expander(f"All OpenSanctions candidates ({len(result['results'])})"):
             rows = []
@@ -499,6 +697,7 @@ if run:
                 rows.append({
                     "Match": "✅" if r.get("match") else "—",
                     "Score": f"{r.get('score', 0):.2f}",
+                    "Sanctioned": "❌" if _has_sanction_signal(r) else "✓",
                     "Entity": r.get("caption", ""),
                     "ID": r.get("id", ""),
                 })
