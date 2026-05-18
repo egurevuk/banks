@@ -423,6 +423,59 @@ def bik_info_lookup(bic: str) -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 1 (assist): iban.ru SWIFT BIC ↔ BIK directory
+# ─────────────────────────────────────────────────────────────────────────────
+
+IBAN_RU_SWIFT_URL = "https://www.iban.ru/swift-bic-kodov"
+
+# Match a table row like  `| TICSRUMMXXX | 044525974 | АО "ТИНЬКОФФ БАНК |`
+# SWIFT BIC format: 4 letters (institution) + 2 letters (country) + 2 alphanumeric
+# (location) + optional 3 alphanumeric (branch). All entries here are 11-char.
+IBAN_RU_ROW_RE = re.compile(
+    r"\|\s*([A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\s*\|\s*(\d{9})\s*\|"
+)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_iban_ru_swift_table() -> dict[str, str]:
+    """Fetch & parse iban.ru's BIK ↔ SWIFT mapping table.
+
+    Returns a dict {BIK: SWIFT_code} covering ~300 Russian banks and many of
+    their regional branches with branch-level SWIFTs. Per the iban.ru footer,
+    the source is S.W.I.F.T. SCRL with permission.
+
+    Why this matters: CBR's SOAP API (Step 1) does include SWIFTs but nested
+    deep in the credit-org XML and not always reliable for branches. This
+    table gives us a clean per-BIC SWIFT lookup with branch granularity.
+
+    Cached for 24 hours in Streamlit so each screening doesn't hit iban.ru.
+    """
+    try:
+        r = requests.get(
+            IBAN_RU_SWIFT_URL,
+            timeout=20,
+            headers={"User-Agent": "Mozilla/5.0 BIC-screening-tool"},
+        )
+        r.raise_for_status()
+    except Exception:
+        return {}
+    table: dict[str, str] = {}
+    for m in IBAN_RU_ROW_RE.finditer(r.text):
+        swift = m.group(1).upper()
+        bik = m.group(2)
+        # First occurrence wins (head office is usually listed before branches
+        # for the same BIK, though duplicates are rare since BIK is unique).
+        if bik not in table:
+            table[bik] = swift
+    return table
+
+
+def iban_ru_swift_for_bic(bic: str) -> str | None:
+    """Look up a single BIC in the iban.ru table. Returns 11-char SWIFT or None."""
+    return fetch_iban_ru_swift_table().get(bic)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 3: OpenSanctions matching API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -962,6 +1015,42 @@ with st.status("Step 1 · CBR: resolve BIC → internal code → SWIFT", expande
         for line in trace:
             st.markdown(f"- {line}")
 
+    # ── iban.ru SWIFT BIC lookup ──────────────────────────────────────────
+    # Independent of CBR's SOAP result, look the BIC up in iban.ru's SWIFT↔BIK
+    # directory. iban.ru publishes the table with SWIFT SCRL's permission and
+    # has per-branch SWIFTs that CBR's SOAP doesn't always expose. The lookup
+    # is cached for 24h so this is effectively a one-time HTTP call per day
+    # regardless of how many BICs are screened.
+    iban_ru_swift = iban_ru_swift_for_bic(bic)
+    if iban_ru_swift:
+        st.markdown(
+            f"📡 **iban.ru SWIFT lookup:** `{iban_ru_swift}` "
+            "_(source: iban.ru BIK↔SWIFT directory, S.W.I.F.T. SCRL data)_"
+        )
+        # Merge into cbr's swift_codes pool so Step 3 picks it up alongside
+        # any SWIFTs CBR extracted. Both 11- and 8-char forms — OpenSanctions
+        # stores SWIFTs canonically as 8-char so sending both forms guarantees
+        # the matcher finds the entity regardless of how it's keyed.
+        existing = list(cbr.get("swift_codes") or [])
+        added = []
+        if iban_ru_swift not in existing:
+            existing.append(iban_ru_swift)
+            added.append(iban_ru_swift)
+        if len(iban_ru_swift) == 11 and iban_ru_swift[:8] not in existing:
+            existing.append(iban_ru_swift[:8])
+            added.append(iban_ru_swift[:8])
+        cbr["swift_codes"] = existing
+        if added and trace is not None:
+            # Track in the resolution_trace so the audit log shows the source
+            cbr.setdefault("resolution_trace", []).append(
+                f"iban.ru: added SWIFT(s) {', '.join(added)} for BIC {bic}"
+            )
+    else:
+        st.caption(
+            "_(iban.ru: no SWIFT entry for this BIC — bank may not be on the table "
+            "or the table doesn't cover this branch)_"
+        )
+
     if cbr.get("error"):
         st.warning(
             f"⚠️ {cbr['error']}. Continuing with bik-info.ru — the bank can still "
@@ -980,7 +1069,7 @@ with st.status("Step 1 · CBR: resolve BIC → internal code → SWIFT", expande
             st.write("**SWIFT codes registered:**", ", ".join(f"`{s}`" for s in cbr["swift_codes"]))
         else:
             st.warning(
-                "No SWIFT codes registered in CBR for this BIC. "
+                "No SWIFT codes registered for this BIC (neither CBR nor iban.ru). "
                 "Bank likely operates only domestically (RUB) or routes FX through correspondents."
             )
 
