@@ -386,6 +386,10 @@ def _synthetic_entity_from_directory(bik: str, info: dict) -> dict:
 # We therefore raise REVIEW rather than SANCTIONED when a bank is missing.
 
 OHMYSWIFT_URL = "https://ohmyswift.io/ne-pod-sankciyami-spisok"
+# Bundled snapshot — used when the live URL is unreachable (e.g. blocked
+# from Streamlit Cloud's IP range). Refresh this file by running the
+# `build_ohmyswift_snapshot.py` script after a manual update.
+OHMYSWIFT_SNAPSHOT_PATH = "ohmyswift_snapshot.json"
 
 
 def _normalize_swift(code: str) -> str:
@@ -401,26 +405,12 @@ def _normalize_swift(code: str) -> str:
     return s[:8] if len(s) >= 8 else s
 
 
-@st.cache_data(show_spinner=False, ttl=86400)  # refresh daily
-def fetch_ohmyswift_whitelist() -> dict | None:
-    """Download and parse the ohmyswift.io 'not sanctioned' list.
+def _parse_ohmyswift_html(html: str) -> dict | None:
+    """Extract the SWIFT/BIC table from the ohmyswift.io page HTML.
 
-    Returns ``{"swifts": set[str], "by_swift": dict[str, dict], "updated": str,
-    "count": int, "error": None}`` on success, or ``{"error": "..."}`` on
-    failure so the caller can surface diagnostics in the UI.
+    Returns ``{"swifts": set[str], "by_swift": dict, "updated": str, "count": int}``
+    or ``None`` if the page didn't contain a parseable table.
     """
-    try:
-        resp = requests.get(
-            OHMYSWIFT_URL,
-            timeout=20,
-            headers={**BROWSER_HEADERS, "Cache-Control": "no-cache"},
-        )
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        return {"error": f"fetch failed: {type(exc).__name__}: {exc}"}
-
-    html = resp.text
-    # Each row has: <td><a href="...">SWIFT</a></td> <td>russian name</td> <td>english name</td>
     row_re = re.compile(
         r'<td[^>]*>\s*<a[^>]*href="[^"]*/swift-codes/[^"]+">([A-Z0-9]+)</a>\s*</td>\s*'
         r'<td[^>]*>(.*?)</td>\s*'
@@ -440,20 +430,92 @@ def fetch_ohmyswift_whitelist() -> dict | None:
             "name_ru": unescape(name_ru),
             "name_en": unescape(name_en),
         }
-
     if not by_swift:
-        return None  # parsing failed
-
-    # Updated-date pulled from page meta if present
-    m = re.search(r"Дата обновления:\s*([0-9.]+)", html)
-    updated = m.group(1) if m else None
-
+        return None
+    updated_m = re.search(r"Дата обновления:\s*([0-9.]+)", html)
     return {
         "swifts": set(by_swift.keys()),
         "by_swift": by_swift,
-        "updated": updated,
+        "updated": updated_m.group(1) if updated_m else None,
         "count": len(by_swift),
     }
+
+
+def _load_ohmyswift_snapshot() -> dict | None:
+    """Load the bundled JSON snapshot of the OhMySwift list.
+
+    The snapshot lives next to app.py so Streamlit Cloud can serve it even
+    when ohmyswift.io itself is unreachable. Returns the same shape as the
+    live parser.
+    """
+    try:
+        # Look next to this file, not the cwd, so it works on any deployment
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, OHMYSWIFT_SNAPSHOT_PATH)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    by_swift: dict[str, dict] = {}
+    for entry in data.get("entries", []):
+        key = _normalize_swift(entry.get("key") or entry.get("swift") or "")
+        if not key:
+            continue
+        by_swift[key] = {
+            "swift": entry.get("swift") or key,
+            "name_ru": entry.get("name_ru") or "",
+            "name_en": entry.get("name_en") or "",
+        }
+    if not by_swift:
+        return None
+    return {
+        "swifts": set(by_swift.keys()),
+        "by_swift": by_swift,
+        "updated": data.get("updated"),
+        "count": len(by_swift),
+        "captured_at": data.get("captured_at"),
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=86400)  # refresh daily
+def fetch_ohmyswift_whitelist() -> dict | None:
+    """Get the OhMySwift 'not sanctioned' list, preferring fresh live data
+    but falling back to the bundled snapshot if the live URL is unreachable.
+
+    Returns a dict shaped like
+    ``{"swifts": set, "by_swift": dict, "updated": str, "count": int,
+       "source": "live" | "snapshot", "live_error": str | None}``
+    so the UI can surface which source was used and (when applicable) why
+    the live fetch failed. Returns ``None`` only if both the live fetch
+    *and* the snapshot load fail (which would mean the JSON was deleted).
+    """
+    # Always try live first so manual updates to ohmyswift.io are picked up
+    live_error: str | None = None
+    try:
+        resp = requests.get(
+            OHMYSWIFT_URL,
+            timeout=20,
+            headers={**BROWSER_HEADERS, "Cache-Control": "no-cache"},
+        )
+        resp.raise_for_status()
+        parsed = _parse_ohmyswift_html(resp.text)
+        if parsed:
+            parsed["source"] = "live"
+            parsed["live_error"] = None
+            return parsed
+        live_error = "live page returned no parseable rows (HTML structure may have changed)"
+    except requests.RequestException as exc:
+        live_error = f"{type(exc).__name__}: {exc}"
+
+    # Fall back to bundled snapshot
+    snapshot = _load_ohmyswift_snapshot()
+    if snapshot:
+        snapshot["source"] = "snapshot"
+        snapshot["live_error"] = live_error
+        return snapshot
+
+    # Worst case: both failed
+    return {"error": f"live fetch and snapshot both failed. Live: {live_error}"}
 
 
 def check_ohmyswift_whitelist(bank: dict) -> dict:
@@ -1312,19 +1374,34 @@ with st.sidebar:
     # OhMySwift whitelist status
     wl_meta = fetch_ohmyswift_whitelist()
     if wl_meta and "swifts" in wl_meta:
+        source = wl_meta.get("source", "?")
+        if source == "live":
+            source_label = "🟢 live from ohmyswift.io"
+        elif source == "snapshot":
+            captured = wl_meta.get("captured_at", "—")
+            source_label = f"🟡 bundled snapshot (captured {captured})"
+        else:
+            source_label = source
         st.markdown(
             f"**📋 OhMySwift whitelist**  \n"
             f"{wl_meta['count']} banks, "
             f"updated {wl_meta.get('updated', '—')}  \n"
-            f"[Source ↗](https://ohmyswift.io/ne-pod-sankciyami-spisok)"
+            f"Source: {source_label}  \n"
+            f"[View list ↗](https://ohmyswift.io/ne-pod-sankciyami-spisok)"
         )
+        if source == "snapshot" and wl_meta.get("live_error"):
+            st.caption(
+                f"⚠️ Live fetch failed (_{wl_meta['live_error']}_) — using "
+                f"bundled snapshot. The list is refreshed each time the app "
+                f"is redeployed."
+            )
         st.caption(
             "⚠️ Scope: **US SDN + EU only**. Banks sanctioned by UK / "
             "Canada / Switzerland / Japan / Australia / Ukraine may still "
             "appear here — OpenSanctions catches those."
         )
     else:
-        err = (wl_meta or {}).get("error") or "host unreachable from this server"
+        err = (wl_meta or {}).get("error") or "snapshot file missing"
         st.caption(
             f"📋 OhMySwift whitelist unavailable — _{err}_. "
             f"Verdicts fall back to OpenSanctions-only. "
