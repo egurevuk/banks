@@ -130,10 +130,18 @@ def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_full_entity(entity_id: str, api_key: str) -> dict | None:
-    """Get a nested entity record (with sanctions relationships) by ID."""
+    """Get a fully-nested entity record by ID.
+
+    `nested=true` causes the API to inline related Sanction objects under
+    ``properties.sanctions`` (and other relationships like ownership), each
+    one carrying its own authority, program, dates, and reason.
+    """
     url = f"{OS_BASE}/entities/{entity_id}"
     resp = requests.get(
-        url, headers=os_headers(api_key), timeout=REQUEST_TIMEOUT
+        url,
+        params={"nested": "true"},
+        headers=os_headers(api_key),
+        timeout=REQUEST_TIMEOUT,
     )
     if resp.status_code == 404:
         return None
@@ -353,6 +361,185 @@ def render_bank_card(bank: dict) -> None:
         if aliases:
             st.write("**Aliases:** " + " · ".join(aliases[:10]))
         st.write(f"**OpenSanctions entity:** [`{bank.get('id')}`](https://www.opensanctions.org/entities/{bank.get('id')}/)")
+
+
+# Map from OpenSanctions referent prefixes to the issuing authority. Each
+# entity's `referents` list contains source IDs like `ofac-12345` or
+# `gb-hmt-15016` — we use these to enumerate which sanctions lists the bank
+# appears on. Order matters: longest prefix wins (so `ofac-pr-` is matched
+# before `ofac-`).
+SOURCE_PREFIX_MAP: list[tuple[str, str]] = [
+    ("ofac-pr-",      "🇺🇸 US OFAC press release"),
+    ("ofac-",         "🇺🇸 US OFAC SDN list"),
+    ("usgsa-",        "🇺🇸 US GSA debarment"),
+    ("gb-hmt-",       "🇬🇧 UK HM Treasury (OFSI)"),
+    ("gb-fcdo-",      "🇬🇧 UK FCDO sanctions"),
+    ("gb-invban-",    "🇬🇧 UK Investment Ban"),
+    ("gb-coh-psc-",   "🇬🇧 UK Companies House (PSC)"),
+    ("gb-coh-",       "🇬🇧 UK Companies House"),
+    ("eu-fsf-",       "🇪🇺 EU Financial Sanctions Files"),
+    ("eu-sancmap-",   "🇪🇺 EU Sanctions Map"),
+    ("eu-oj-",        "🇪🇺 EU Official Journal"),
+    ("ca-sema-",      "🇨🇦 Canada SEMA"),
+    ("ch-seco-",      "🇨🇭 Switzerland SECO"),
+    ("au-dfat-",      "🇦🇺 Australia DFAT"),
+    ("ja-mof-",       "🇯🇵 Japan MoF"),
+    ("nz-",           "🇳🇿 New Zealand sanctions"),
+    ("ua-nsdc-",      "🇺🇦 Ukraine NSDC"),
+    ("ua-ws-",        "🇺🇦 Ukraine 'War & Sanctions'"),
+    ("fr-ga-",        "🇫🇷 France national freeze"),
+    ("be-fod-",       "🇧🇪 Belgium FOD"),
+    ("mc-freezes-",   "🇲🇨 Monaco freeze list"),
+    ("sg-",           "🇸🇬 Singapore sanctions"),
+    ("tw-shtc-",      "🇹🇼 Taiwan SHTC"),
+    ("ru-bik-",       "🇷🇺 CBR banking registry"),
+    ("ru-inn-",       "🇷🇺 Russia Federal Tax Service"),
+    ("lei-",          "GLEIF (LEI)"),
+    ("bic-",          "SWIFT BIC reference"),
+    ("icijol-",       "ICIJ Offshore Leaks"),
+    ("gem-",          "Global Energy Monitor"),
+    ("permid-",       "LSEG PermID"),
+]
+
+
+def label_referent(ref: str) -> str | None:
+    """Return a human-readable authority label for a source ID prefix."""
+    for prefix, label in SOURCE_PREFIX_MAP:
+        if ref.startswith(prefix):
+            return label
+    return None
+
+
+def render_sanctions_panel(bank_entity: dict) -> None:
+    """Render the SANCTIONED detail panel: programs, dates, sources, link."""
+    bank_entity = bank_entity or {}
+    props = bank_entity.get("properties", {}) or {}
+    eid = bank_entity.get("id")
+    name = first(props, "name", "(unnamed)")
+
+    # ----- Top-of-panel: prominent OpenSanctions link --------------------
+    if eid:
+        os_url = f"https://www.opensanctions.org/entities/{eid}/"
+        st.markdown(
+            f"#### 🚨 {name} is on one or more sanctions lists\n\n"
+            f"**Full record on OpenSanctions:** "
+            f"[opensanctions.org/entities/{eid}/]({os_url})  \n"
+            f"_The page above is the canonical source — it lists every "
+            f"designation, the original wording, related entities, and links "
+            f"to each authority's primary record._"
+        )
+        st.link_button("🔗 Open OpenSanctions record ↗", os_url, type="primary")
+
+    # ----- Sanction designations (from nested Sanction sub-entities) -----
+    # When fetched with ?nested=true, properties.sanctions contains one
+    # Sanction object per designation, each with authority/program/dates.
+    sanction_objs = props.get("sanctions") or []
+    rows: list[dict] = []
+    for s in sanction_objs:
+        if not isinstance(s, dict):
+            continue
+        sp = s.get("properties", {}) or {}
+        rows.append({
+            "Authority":   first(sp, "authority"),
+            "Country":     first(sp, "country"),
+            "Program":     first(sp, "program"),
+            "Listed":      first(sp, "listingDate", first(sp, "startDate")),
+            "Start":       first(sp, "startDate"),
+            "End":         first(sp, "endDate", "—"),
+            "Reason":      (first(sp, "reason", "") or first(sp, "summary", ""))[:300],
+            "Source URL":  first(sp, "sourceUrl", ""),
+        })
+
+    if rows:
+        st.markdown("##### Sanctions designations")
+        # Date-aware sort — newest first
+        rows.sort(key=lambda r: str(r.get("Listed") or r.get("Start") or ""), reverse=True)
+        df = pd.DataFrame(rows)
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Source URL": st.column_config.LinkColumn(
+                    "Source", display_text="open ↗"
+                ),
+                "Reason": st.column_config.TextColumn("Reason / note", width="large"),
+            },
+        )
+        st.caption(f"{len(rows)} designation(s) recorded by OpenSanctions.")
+    else:
+        st.info(
+            "Designation details aren't inlined in the response — open the "
+            "OpenSanctions page above for the per-program breakdown."
+        )
+
+    # ----- Source authorities derived from referents --------------------
+    referents = bank_entity.get("referents") or []
+    authorities = {}
+    for ref in referents:
+        lbl = label_referent(str(ref))
+        if not lbl:
+            continue
+        # Skip pure-reference sources that aren't sanctions/debarment lists
+        if lbl in (
+            "🇷🇺 CBR banking registry",
+            "🇷🇺 Russia Federal Tax Service",
+            "GLEIF (LEI)",
+            "SWIFT BIC reference",
+            "🇬🇧 UK Companies House",
+            "🇬🇧 UK Companies House (PSC)",
+            "ICIJ Offshore Leaks",
+            "Global Energy Monitor",
+            "LSEG PermID",
+        ):
+            continue
+        authorities[lbl] = authorities.get(lbl, 0) + 1
+
+    if authorities:
+        st.markdown("##### Listed on")
+        chip_html = " ".join(
+            f"<span style='display:inline-block;margin:3px 6px 3px 0;"
+            f"padding:4px 10px;background:#fdecea;color:#b00020;"
+            f"border-radius:12px;font-size:0.85rem;font-weight:500'>"
+            f"{lbl}{' ×' + str(n) if n > 1 else ''}</span>"
+            for lbl, n in sorted(authorities.items())
+        )
+        st.markdown(chip_html, unsafe_allow_html=True)
+
+    # ----- Topic chips --------------------------------------------------
+    topics = props.get("topics") or bank_entity.get("topics") or []
+    if topics:
+        TOPIC_LABELS = {
+            "sanction":          "🚫 Sanctioned",
+            "sanction.linked":   "🔗 Sanction-linked",
+            "sanction.counter":  "↩ Counter-sanction",
+            "debarment":         "⛔ Debarred",
+            "export.control":    "📦 Export-controlled",
+            "role.pep":          "👤 PEP",
+            "role.rca":          "👥 PEP relative/associate",
+            "corp.public":       "🏢 Public company",
+            "fin.bank":          "🏦 Bank",
+        }
+        chip_html = " ".join(
+            f"<span style='display:inline-block;margin:3px 6px 3px 0;"
+            f"padding:4px 10px;background:#f0f2f6;color:#222;"
+            f"border-radius:12px;font-size:0.85rem'>"
+            f"{TOPIC_LABELS.get(t, t)}</span>"
+            for t in topics
+        )
+        st.markdown("##### Topics")
+        st.markdown(chip_html, unsafe_allow_html=True)
+
+    # ----- Narrative summary / notes ------------------------------------
+    summary = first(props, "summary", "")
+    notes = props.get("notes") or props.get("description") or []
+    notes_text = " ".join(str(n) for n in notes) if isinstance(notes, list) else str(notes)
+    if summary and summary != "—":
+        st.markdown("##### Summary")
+        st.write(summary)
+    if notes_text and notes_text != "—":
+        with st.expander("Official rationale / notes from designating authorities"):
+            st.write(notes_text[:3000] + ("…" if len(notes_text) > 3000 else ""))
 
 
 def render_match_table(top_hits: list[dict]) -> None:
@@ -588,9 +775,19 @@ with tab_single:
                 st.divider()
                 render_bank_card(res["bank_full"] or res["bank"])
 
+            # Detailed sanctions panel — only when this bank is actually sanctioned
+            if res.get("status") == "sanctioned":
+                st.divider()
+                render_sanctions_panel(res["bank_full"] or res["bank"])
+
             if res.get("verdict"):
                 st.divider()
                 st.subheader("Sanctions match candidates")
+                st.caption(
+                    "Independent verification: results of querying "
+                    "`POST /match/sanctions` with the bank's properties. "
+                    "A score ≥ 0.85 with `match=true` is a confirmed hit."
+                )
                 render_match_table(res["verdict"]["top_hits"])
 
             with st.expander("Raw API responses (debug)"):
@@ -645,6 +842,7 @@ with tab_batch:
                 rows = []
                 for r in results:
                     props = (r.get("bank") or {}).get("properties", {}) or {}
+                    bank_id = (r.get("bank") or {}).get("id")
                     rows.append({
                         "BIK": r["bik"],
                         "Status": r["status"],
@@ -664,6 +862,10 @@ with tab_batch:
                             if r.get("verdict") and r["verdict"]["reasons"]
                             else (r.get("error") or "")
                         ),
+                        "OpenSanctions": (
+                            f"https://www.opensanctions.org/entities/{bank_id}/"
+                            if bank_id else ""
+                        ),
                     })
                 df = pd.DataFrame(rows)
 
@@ -681,6 +883,11 @@ with tab_batch:
                     styled,
                     use_container_width=True,
                     hide_index=True,
+                    column_config={
+                        "OpenSanctions": st.column_config.LinkColumn(
+                            "OpenSanctions", display_text="open ↗"
+                        ),
+                    },
                 )
 
                 # Export
@@ -703,6 +910,10 @@ with tab_batch:
                             continue
                         for line in r["verdict"]["reasons"]:
                             st.write(f"• {line}")
+                        if r["status"] == "sanctioned":
+                            st.divider()
+                            render_sanctions_panel(r["bank_full"] or r["bank"])
+                        st.divider()
                         render_match_table(r["verdict"]["top_hits"])
 
 st.divider()
