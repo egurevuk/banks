@@ -291,7 +291,66 @@ def name_variants(name: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def search_opensanctions(name: str, api_key: str | None = None) -> dict[str, Any]:
+def search_opensanctions_by_bik_code(
+    bik: str, api_key: str | None = None
+) -> dict[str, Any]:
+    """Search OpenSanctions for an entity with this BIK in its ``bikCode``
+    property — an exact identifier match.
+
+    OpenSanctions Company entities carry the Russian BIK in the ``bikCode``
+    property (see e.g.
+    https://www.opensanctions.org/statements/NK-bRyPm6xPipVgtWYe6wsPDC/?prop=bikCode).
+    When the BIK is registered against a sanctioned entity, this gives us
+    a 1.00-score exact match — no transliteration, no fuzzy logic.
+
+    Returns the same shape as :func:`search_opensanctions_by_name` so the
+    pipeline can treat the two paths uniformly.
+    """
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"ApiKey {api_key}"
+
+    payload = {
+        "queries": {
+            "q1": {
+                "schema": "Company",
+                "properties": {
+                    "bikCode": [bik],
+                    "country": ["ru"],
+                },
+            }
+        }
+    }
+    try:
+        resp = requests.post(
+            f"{OPENSANCTIONS_API}/match/sanctions",
+            json=payload,
+            headers=headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        return {"ok": False, "error": f"OpenSanctions bikCode lookup failed: {exc}",
+                "results": []}
+
+    try:
+        data = resp.json()
+    except ValueError:
+        return {"ok": False, "error": "OpenSanctions returned non-JSON",
+                "results": []}
+
+    results = (
+        data.get("responses", {})
+        .get("q1", {})
+        .get("results", [])
+    ) or []
+    return {"ok": True, "error": None, "results": results}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def search_opensanctions_by_name(
+    name: str, api_key: str | None = None
+) -> dict[str, Any]:
     """Search OpenSanctions for a bank by name (multi-variant fuzzy match).
 
     We ship the original Cyrillic name AND its Latin transliteration AND
@@ -515,34 +574,73 @@ def _pick_best_candidate(results: list[dict]) -> dict | None:
 
 
 def screen(bik: str, api_key: str | None) -> dict[str, Any]:
-    """Full pipeline: bik-info → OpenSanctions /match → enriched entity."""
+    """Full pipeline.
+
+    1. ``bik-info.ru`` → bank name (always done; used for display).
+    2. ``OpenSanctions /match`` with ``bikCode`` property = an EXACT
+       identifier match. Russian banks indexed in OpenSanctions store the
+       BIK as a Company property, so this hits the canonical sanctioned
+       entity directly when one exists.
+    3. **Fallback** — if step 2 returns no usable hit (common for branch
+       BIKs whose parent legal entity stores only its own head-office
+       BIK), fall through to name-based fuzzy search with transliteration
+       and variant expansion.
+    """
     info = lookup_bik(bik)
     if not info["ok"]:
         return {"step": "lookup", "bik": bik, **info}
 
     name = info["name"]
-    match = search_opensanctions(name, api_key=api_key)
-    if not match["ok"]:
-        return {"step": "match", "bik": bik, "name": name,
-                "raw_bik_info": info["raw"], **match}
 
-    results = match["results"]
-    candidate = _pick_best_candidate(results)
+    # ---- Step 2: exact-identifier search via bikCode property ---------
+    bik_match = search_opensanctions_by_bik_code(bik, api_key=api_key)
+    bik_results = bik_match.get("results") or []
+    bik_candidate = _pick_best_candidate(bik_results) if bik_results else None
+
+    matched_via = None
+    candidate = None
+    results: list[dict] = []
+    variants_used: list[str] = []
+
+    if bik_candidate and _has_sanction_signal(bik_candidate):
+        # Exact BIK match against a sanctioned entity — definitive.
+        candidate = bik_candidate
+        results = bik_results
+        matched_via = "bikCode"
+    else:
+        # ---- Step 3: name-based fallback (handles branches) ----------
+        name_match = search_opensanctions_by_name(name, api_key=api_key)
+        if not name_match["ok"]:
+            return {"step": "match", "bik": bik, "name": name,
+                    "raw_bik_info": info["raw"], **name_match}
+        results = name_match["results"]
+        variants_used = name_match.get("variants_used", [])
+        candidate = _pick_best_candidate(results)
+        if candidate:
+            matched_via = "name"
+        # If neither path produced a useful candidate, fall back to whatever
+        # bikCode returned (e.g. an unsanctioned but legitimate ID match)
+        if not candidate and bik_candidate:
+            candidate = bik_candidate
+            results = bik_results
+            matched_via = "bikCode"
 
     enriched = None
     if candidate and candidate.get("id"):
         enriched = fetch_full_entity(candidate["id"], api_key=api_key)
 
     return {
-        "step": "ok",
-        "ok": True,
-        "bik": bik,
-        "name": name,
-        "raw_bik_info": info["raw"],
-        "results": results,
-        "candidate": candidate,
-        "enriched": enriched,
-        "variants_used": match.get("variants_used", []),
+        "step":          "ok",
+        "ok":            True,
+        "bik":           bik,
+        "name":          name,
+        "raw_bik_info":  info["raw"],
+        "results":       results,
+        "candidate":     candidate,
+        "enriched":      enriched,
+        "variants_used": variants_used,
+        "matched_via":   matched_via,
+        "bik_lookup_ok": bool(bik_results),
     }
 
 
@@ -582,8 +680,9 @@ api_key = get_api_key()
 with st.sidebar:
     st.header("Pipeline")
     st.markdown(
-        "1. `bik-info.ru/api.html?type=json&bik={BIK}` → bank name\n"
-        "2. `api.opensanctions.org/match/sanctions` → name → sanctions hit"
+        "1. `bik-info.ru` → bank name\n"
+        "2. OpenSanctions `/match` with `bikCode` property (exact ID match)\n"
+        "3. Fallback: name search with Cyrillic→Latin transliteration"
     )
     st.markdown("---")
     st.caption(
@@ -624,7 +723,7 @@ if run:
         st.success("✅ **CLEAR** — no OpenSanctions match")
         st.markdown(f"**Bank:** {bank_name}")
         st.caption(
-            "No entity on any sanctions list matched this bank's name. "
+            "No entity on any sanctions list matched this bank by BIK or name. "
             "OpenSanctions covers US OFAC, EU, UK, Canada, Switzerland, "
             "Japan, Australia, Ukraine, and more."
         )
@@ -632,8 +731,22 @@ if run:
         target_entity = enriched or candidate
         sanctioned = is_sanctioned(target_entity)
         score = candidate.get("score", 0.0)
+        matched_via = result.get("matched_via")
 
-        if sanctioned and score >= MATCH_STRONG:
+        # Exact bikCode hit on a sanctioned entity → definitive SANCTIONED
+        # regardless of name-match score.
+        if sanctioned and matched_via == "bikCode":
+            st.markdown(
+                '<div style="background:#dc2626;color:white;padding:12px 16px;'
+                'border-radius:8px;font-weight:600;font-size:1.1rem;'
+                'display:inline-block;">❌ SANCTIONED</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "Exact identifier match: this bank's BIK is recorded "
+                "directly on a sanctioned entity in OpenSanctions."
+            )
+        elif sanctioned and score >= MATCH_STRONG:
             st.markdown(
                 '<div style="background:#dc2626;color:white;padding:12px 16px;'
                 'border-radius:8px;font-weight:600;font-size:1.1rem;'
@@ -648,9 +761,10 @@ if run:
                 unsafe_allow_html=True,
             )
             st.caption(
-                "A sanctioned entity matched this bank's name with moderate "
-                "confidence. Cross-script name comparison rarely hits the "
-                "matcher's strict threshold — inspect the candidate below."
+                "A sanctioned entity matched this bank by fuzzy name. "
+                "The BIK isn't directly listed on the sanctioned entity — "
+                "this is the typical pattern for branch BIKs whose parent "
+                "is the sanctioned legal entity."
             )
         else:
             st.success("✅ **CLEAR** — best match isn't on a sanctions list")
@@ -660,12 +774,18 @@ if run:
             f"**Matched OpenSanctions entity:** "
             f"{target_entity.get('caption', '—')}"
         )
-        st.caption(
-            f"Match score: {score:.2f} "
-            f"({'confirmed' if candidate.get('match') else 'fuzzy'})"
-        )
+        if matched_via == "bikCode":
+            st.caption(
+                f"Resolved via exact `bikCode` property match · "
+                f"score: {score:.2f}"
+            )
+        elif matched_via == "name":
+            st.caption(
+                f"Resolved via fuzzy name match (cross-script) · "
+                f"score: {score:.2f}"
+            )
 
-        if sanctioned and score >= MATCH_POSSIBLE:
+        if sanctioned and (matched_via == "bikCode" or score >= MATCH_POSSIBLE):
             countries = extract_sanction_countries(target_entity)
             if countries:
                 st.markdown("### Sanctioning jurisdictions")
