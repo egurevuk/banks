@@ -679,6 +679,206 @@ def compute_verdict(score: float, token_overlap: list[str]) -> tuple[str, str, s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Sanctioning-jurisdiction mapping
+# ─────────────────────────────────────────────────────────────────────────────
+# Maps OpenSanctions dataset codes to (flag, country/issuer, list label, category).
+# Categories drive how each finding is presented:
+#   "sanctions"         — government sanctions list (the headline finding)
+#   "export_control"    — export control / military end-user list
+#   "counter_sanctions" — sanctions imposed BY this country (e.g. Russia, China)
+#                         against foreign targets — usually inverted risk meaning
+#   "debarment"         — barred from public procurement
+#   "regulatory"        — regulatory warning / enforcement action
+#   "crime"             — wanted lists / criminal databases
+#   "pep"               — politically exposed persons
+#   "reference"         — registries, FATCA, KYB (not a risk indicator)
+#   "leak"              — leaked records (Panama Papers etc.)
+#
+# Curated for the major sanctioning jurisdictions. Unmapped codes fall through
+# to country-prefix detection via COUNTRY_FLAGS/COUNTRY_NAMES.
+DATASET_INFO: dict[str, tuple[str, str, str, str]] = {
+    # United States
+    "us_ofac_sdn":         ("🇺🇸", "United States", "OFAC SDN List", "sanctions"),
+    "us_ofac_cons":        ("🇺🇸", "United States", "OFAC Consolidated (non-SDN)", "sanctions"),
+    "us_trade_csl":        ("🇺🇸", "United States", "Consolidated Screening List", "sanctions"),
+    "us_state_terrorism":  ("🇺🇸", "United States", "State Dept Terrorism Designations", "sanctions"),
+    "us_bis_denied":       ("🇺🇸", "United States", "BIS Denied Persons", "export_control"),
+    "us_bis_entity":       ("🇺🇸", "United States", "BIS Entity List", "export_control"),
+    "us_bis_meu":          ("🇺🇸", "United States", "BIS Military End User", "export_control"),
+    "us_sam_exclusions":   ("🇺🇸", "United States", "SAM Exclusions", "debarment"),
+    "us_fbi_most_wanted":  ("🇺🇸", "United States", "FBI Most Wanted", "crime"),
+    # European Union
+    "eu_fsf":              ("🇪🇺", "European Union", "Financial Sanctions Files (FSF)", "sanctions"),
+    "eu_sanctions_map":    ("🇪🇺", "European Union", "EU Sanctions Map", "sanctions"),
+    "eu_travel_bans":      ("🇪🇺", "European Union", "Travel Bans", "sanctions"),
+    "eu_journal_sanctions":("🇪🇺", "European Union", "Council Official Journal", "sanctions"),
+    "eu_esma_sanctions":   ("🇪🇺", "European Union", "ESMA Sanctions", "regulatory"),
+    "eu_esma_saris":       ("🇪🇺", "European Union", "ESMA Suspensions/Removals", "regulatory"),
+    "eu_edes":             ("🇪🇺", "European Union", "EDES (Early Detection/Exclusion)", "debarment"),
+    "eu_europol_wanted":   ("🇪🇺", "European Union", "Europol Most Wanted", "crime"),
+    # United Kingdom
+    "gb_hmt_sanctions":    ("🇬🇧", "United Kingdom", "HMT Consolidated List", "sanctions"),
+    "gb_fcdo_sanctions":   ("🇬🇧", "United Kingdom", "FCDO Sanctions", "sanctions"),
+    # Switzerland
+    "ch_seco_sanctions":   ("🇨🇭", "Switzerland", "SECO Sanctions", "sanctions"),
+    # Canada
+    "ca_dfatd_sema_sanctions": ("🇨🇦", "Canada", "SEMA Consolidated Sanctions", "sanctions"),
+    "ca_facfoa":           ("🇨🇦", "Canada", "FACFOA (Corrupt Officials)", "sanctions"),
+    "ca_listed_terrorists":("🇨🇦", "Canada", "Listed Terrorist Entities", "sanctions"),
+    "ca_named_research_orgs":("🇨🇦", "Canada", "Research Orgs of Concern", "export_control"),
+    # Australia
+    "au_dfat_sanctions":   ("🇦🇺", "Australia", "DFAT Consolidated", "sanctions"),
+    "au_listed_terrorist_orgs": ("🇦🇺", "Australia", "Listed Terrorist Orgs", "sanctions"),
+    "au_abf_sanctioned_sponsors":("🇦🇺", "Australia", "ABF Sanctioned Sponsors", "sanctions"),
+    # Japan
+    "jp_mof_sanctions":    ("🇯🇵", "Japan", "MOF Economic Sanctions", "sanctions"),
+    "jp_meti_eul":         ("🇯🇵", "Japan", "METI End User List", "export_control"),
+    "jp_meti_ru":          ("🇯🇵", "Japan", "METI Russia List", "sanctions"),
+    # Ukraine
+    "ua_nsdc_sanctions":   ("🇺🇦", "Ukraine", "NSDC Sanctions", "sanctions"),
+    "ua_sfms_blacklist":   ("🇺🇦", "Ukraine", "SFMS Blacklist", "sanctions"),
+    "ua_nabc_sanctions":   ("🇺🇦", "Ukraine", "NABC War & Sanctions", "sanctions"),
+    "ua_war_sanctions":    ("🇺🇦", "Ukraine", "War Sanctions", "sanctions"),
+    # New Zealand
+    "nz_russia_sanctions": ("🇳🇿", "New Zealand", "Russia Sanctions", "sanctions"),
+    "nz_un_sanctions":     ("🇳🇿", "New Zealand", "UN-implemented Sanctions", "sanctions"),
+    # France
+    "fr_tresor_gels_avoir":("🇫🇷", "France", "Trésor National Asset Freezing", "sanctions"),
+    "fr_amf_regulatory_sanctions":("🇫🇷", "France", "AMF Regulatory Sanctions", "regulatory"),
+    "fr_illegal_financial_services":("🇫🇷", "France", "AMF Illegal Financial Services", "regulatory"),
+    # Other EU member states
+    "be_fod_sanctions":    ("🇧🇪", "Belgium", "FOD Financial Sanctions", "sanctions"),
+    "at_nbter_sanctions":  ("🇦🇹", "Austria", "OeNB Terrorism Restrictions", "sanctions"),
+    "ee_international_sanctions":("🇪🇪", "Estonia", "International Sanctions Act", "sanctions"),
+    "cz_national_sanctions":("🇨🇿", "Czechia", "National Sanctions", "sanctions"),
+    "cz_terrorists":       ("🇨🇿", "Czechia", "Anti-Terrorism Designations", "sanctions"),
+    "de_bka_wanted":       ("🇩🇪", "Germany", "BKA Wanted Fugitives", "crime"),
+    # Middle East / Asia
+    "il_wmd_sanctions":    ("🇮🇱", "Israel", "WMD Sanctions", "sanctions"),
+    "il_mod_terrorists":   ("🇮🇱", "Israel", "Terrorists Organizations", "sanctions"),
+    "il_mod_crypto":       ("🇮🇱", "Israel", "Sanctioned Crypto Wallets", "sanctions"),
+    "ir_sanctions":        ("🇮🇷", "Iran", "Iran Sanctions List", "sanctions"),
+    "iq_aml_list":         ("🇮🇶", "Iraq", "Terrorist Fund Freezing", "sanctions"),
+    "in_mha_banned":       ("🇮🇳", "India", "MHA Banned Organizations", "sanctions"),
+    "in_nse_debarred":     ("🇮🇳", "India", "NSE Debarred Entities", "debarment"),
+    "id_dttot":            ("🇮🇩", "Indonesia", "Suspected Terrorists", "sanctions"),
+    "az_fiu_sanctions":    ("🇦🇿", "Azerbaijan", "Domestic Sanctions List", "sanctions"),
+    "eg_terrorists":       ("🇪🇬", "Egypt", "Domestic Terrorist List", "sanctions"),
+    "ar_repet":            ("🇦🇷", "Argentina", "RePET Sanctions", "sanctions"),
+    "br_ceis":             ("🇧🇷", "Brazil", "CEIS Disreputable Companies", "debarment"),
+    "br_tcu_debarred":     ("🇧🇷", "Brazil", "TCU Debarred Bidders", "debarment"),
+    "br_slavery":          ("🇧🇷", "Brazil", "Slavery Prevention List", "regulatory"),
+    # Counter-sanctions — inverted risk meaning
+    "ru_treasury_sanctions":("🇷🇺", "Russia (counter)", "Treasury counter-sanctions", "counter_sanctions"),
+    "cn_sanctions":        ("🇨🇳", "China (counter)", "Counter-sanctions research", "counter_sanctions"),
+    # International / development banks
+    "un_sc_sanctions":     ("🇺🇳", "United Nations", "Security Council Sanctions", "sanctions"),
+    "interpol_red_notices":("🚨", "INTERPOL", "Red Notices", "crime"),
+    "afdb_sanctions":      ("🏦", "African Dev. Bank", "Debarred Entities", "debarment"),
+    "adb_sanctions":       ("🏦", "Asian Dev. Bank", "Sanctions", "debarment"),
+    "ebrd_ineligible":     ("🏦", "EBRD", "Ineligible Entities", "debarment"),
+    "iadb_sanctions":      ("🏦", "Inter-American Dev. Bank", "Sanctions", "debarment"),
+    "wb_sanctions":        ("🏦", "World Bank", "Ineligible Firms", "debarment"),
+    # Reference data (not risk indicators) — surfaced separately
+    "ru_cbr_banks":        ("🇷🇺", "Russia", "Banking Registry (CBR)", "reference"),
+    "ext_us_irs_ffi":      ("🇺🇸", "United States", "FATCA FFI Registry", "reference"),
+    "ext_ru_egrul":        ("🇷🇺", "Russia", "EGRUL Company Registry", "reference"),
+    "ext_icij_offshoreleaks":("📄", "ICIJ", "Offshore Leaks", "leak"),
+    "iso9362_bic":         ("🌐", "SWIFT (ISO 9362)", "BIC Reference Data", "reference"),
+    "wikidata":            ("📚", "Wikidata", "Wikidata", "reference"),
+    "ext_wd_peps":         ("📚", "Wikidata", "PEPs", "pep"),
+}
+
+# Fallback for unmapped datasets — uses the 2-letter prefix before "_"
+COUNTRY_FLAGS: dict[str, str] = {
+    "us": "🇺🇸", "eu": "🇪🇺", "gb": "🇬🇧", "ch": "🇨🇭", "ca": "🇨🇦",
+    "au": "🇦🇺", "jp": "🇯🇵", "ua": "🇺🇦", "nz": "🇳🇿", "fr": "🇫🇷",
+    "de": "🇩🇪", "be": "🇧🇪", "at": "🇦🇹", "nl": "🇳🇱", "ee": "🇪🇪",
+    "cz": "🇨🇿", "pl": "🇵🇱", "es": "🇪🇸", "it": "🇮🇹", "il": "🇮🇱",
+    "ir": "🇮🇷", "iq": "🇮🇶", "kp": "🇰🇵", "ar": "🇦🇷", "br": "🇧🇷",
+    "az": "🇦🇿", "eg": "🇪🇬", "in": "🇮🇳", "id": "🇮🇩", "by": "🇧🇾",
+    "ru": "🇷🇺", "cn": "🇨🇳", "kz": "🇰🇿", "lv": "🇱🇻", "lt": "🇱🇹",
+    "no": "🇳🇴", "se": "🇸🇪", "fi": "🇫🇮", "dk": "🇩🇰", "ie": "🇮🇪",
+    "is": "🇮🇸", "gg": "🇬🇬", "ky": "🇰🇾", "im": "🇮🇲", "mt": "🇲🇹",
+    "cy": "🇨🇾", "hr": "🇭🇷", "bg": "🇧🇬", "ro": "🇷🇴", "rs": "🇷🇸",
+    "ge": "🇬🇪", "am": "🇦🇲", "tr": "🇹🇷", "sa": "🇸🇦", "ae": "🇦🇪",
+    "za": "🇿🇦", "mx": "🇲🇽", "co": "🇨🇴", "ve": "🇻🇪", "cu": "🇨🇺",
+    "hk": "🇭🇰", "tw": "🇹🇼", "sg": "🇸🇬", "kr": "🇰🇷", "un": "🇺🇳",
+}
+COUNTRY_NAMES: dict[str, str] = {
+    "us": "United States", "eu": "European Union", "gb": "United Kingdom",
+    "ch": "Switzerland", "ca": "Canada", "au": "Australia", "jp": "Japan",
+    "ua": "Ukraine", "nz": "New Zealand", "fr": "France", "de": "Germany",
+    "be": "Belgium", "at": "Austria", "nl": "Netherlands", "ee": "Estonia",
+    "cz": "Czechia", "pl": "Poland", "es": "Spain", "it": "Italy",
+    "il": "Israel", "ir": "Iran", "iq": "Iraq", "kp": "DPRK",
+    "ar": "Argentina", "br": "Brazil", "az": "Azerbaijan", "eg": "Egypt",
+    "in": "India", "id": "Indonesia", "by": "Belarus", "ru": "Russia",
+    "cn": "China", "kz": "Kazakhstan", "lv": "Latvia", "lt": "Lithuania",
+    "no": "Norway", "se": "Sweden", "fi": "Finland", "dk": "Denmark",
+    "ie": "Ireland", "is": "Iceland", "gg": "Guernsey", "ky": "Cayman Islands",
+    "im": "Isle of Man", "mt": "Malta", "cy": "Cyprus", "hr": "Croatia",
+    "bg": "Bulgaria", "ro": "Romania", "rs": "Serbia", "ge": "Georgia",
+    "am": "Armenia", "tr": "Turkey", "sa": "Saudi Arabia", "ae": "UAE",
+    "za": "South Africa", "mx": "Mexico", "co": "Colombia", "ve": "Venezuela",
+    "cu": "Cuba", "hk": "Hong Kong", "tw": "Taiwan", "sg": "Singapore",
+    "kr": "Korea", "un": "United Nations",
+}
+
+# Categories that count as "the country has sanctioned this entity"
+SANCTIONING_CATEGORIES = {"sanctions", "export_control"}
+
+
+def categorize_datasets(datasets: list[str] | None) -> dict[str, Any]:
+    """Group a result's datasets by sanctioning category and country.
+
+    Returns a dict with these keys:
+        sanctions: {(flag, country): [list_labels]} — primary findings
+        counter_sanctions: same shape — inverted meaning, explained inline
+        other_risk: same shape — debarment, regulatory, crime
+        reference: [(flag, country, label)] — registries, FATCA, KYB
+        unmapped: [dataset_codes] — codes we couldn't classify
+    """
+    out: dict[str, Any] = {
+        "sanctions": {},
+        "counter_sanctions": {},
+        "other_risk": {},
+        "reference": [],
+        "unmapped": [],
+    }
+    for ds in datasets or []:
+        info = DATASET_INFO.get(ds)
+        if info is not None:
+            flag, country, label, category = info
+        else:
+            # Unmapped — try prefix detection
+            prefix = ds.split("_", 1)[0] if "_" in ds else ds
+            if prefix == "ext":
+                # External enrichment — silently skip (not sanctions)
+                continue
+            flag = COUNTRY_FLAGS.get(prefix)
+            country = COUNTRY_NAMES.get(prefix)
+            if not (flag and country):
+                out["unmapped"].append(ds)
+                continue
+            # Country known but specific dataset unknown — assume sanctions-grade
+            # (most government-prefixed OS datasets are sanctions lists)
+            label = ds
+            category = "sanctions"
+
+        key = (flag, country)
+        if category in SANCTIONING_CATEGORIES:
+            out["sanctions"].setdefault(key, []).append(label)
+        elif category == "counter_sanctions":
+            out["counter_sanctions"].setdefault(key, []).append(label)
+        elif category in ("debarment", "regulatory", "crime"):
+            out["other_risk"].setdefault(key, []).append(label)
+        elif category in ("reference", "leak", "pep"):
+            out["reference"].append((flag, country, label))
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1040,6 +1240,81 @@ else:
                 rid = r.get("id")
                 if rid:
                     st.markdown(f"[Open in OpenSanctions ↗](https://opensanctions.org/entities/{rid}/)")
+
+            # ── Sanctioning Jurisdictions ───────────────────────────────────
+            # New block: parse the entity's datasets and group by issuing country.
+            # OpenSanctions dataset codes are ISO-prefixed (us_*, eu_*, gb_*, ...)
+            # so we can map them to flag + country + list-name. Sanctions and
+            # export-control go in the headline list; counter-sanctions (Russia,
+            # China) are shown separately because their meaning is inverted;
+            # debarment/regulatory/crime as "other risk"; registries as reference.
+            buckets = categorize_datasets(r.get("datasets") or [])
+            st.markdown("---")
+            if buckets["sanctions"]:
+                n_jurisdictions = len(buckets["sanctions"])
+                st.markdown(
+                    f"#### 🌍 Sanctioning Jurisdictions ({n_jurisdictions})"
+                )
+                st.caption(
+                    "Countries / international bodies whose sanctions or "
+                    "export-control regimes cover this entity:"
+                )
+                # Sort by country name within each line
+                for (flag, country), lists in sorted(
+                    buckets["sanctions"].items(), key=lambda kv: kv[0][1]
+                ):
+                    deduped = list(dict.fromkeys(lists))
+                    list_str = " · ".join(f"_{l}_" for l in deduped)
+                    st.markdown(f"- {flag} **{country}** — {list_str}")
+            else:
+                st.markdown("#### 🌍 Sanctioning Jurisdictions")
+                st.info(
+                    "No sanctioning jurisdictions found for this entity. "
+                    "Either OpenSanctions has not seen it on any government "
+                    "sanctions list, or it appears only in reference data "
+                    "(registries, FATCA, KYB). See below for details."
+                )
+
+            if buckets["counter_sanctions"]:
+                st.markdown("**Counter-sanctions (entity is target of):**")
+                for (flag, country), lists in sorted(
+                    buckets["counter_sanctions"].items(), key=lambda kv: kv[0][1]
+                ):
+                    deduped = list(dict.fromkeys(lists))
+                    list_str = " · ".join(f"_{l}_" for l in deduped)
+                    st.markdown(f"- {flag} **{country}** — {list_str}")
+                st.caption(
+                    "_Counter-sanctions are imposed BY a country (e.g. Russia, "
+                    "China) AGAINST foreign targets. Being listed here means the "
+                    "entity is sanctioned by Russia/China — typically not a "
+                    "compliance risk for Western counterparties, but worth "
+                    "knowing context._"
+                )
+
+            if buckets["other_risk"]:
+                st.markdown("**Other risk findings** _(debarment / regulatory / crime):_")
+                for (flag, country), lists in sorted(
+                    buckets["other_risk"].items(), key=lambda kv: kv[0][1]
+                ):
+                    deduped = list(dict.fromkeys(lists))
+                    list_str = " · ".join(f"_{l}_" for l in deduped)
+                    st.markdown(f"- {flag} **{country}** — {list_str}")
+
+            if buckets["reference"]:
+                with st.expander(
+                    f"Reference data sources ({len(buckets['reference'])}) — "
+                    f"not risk indicators"
+                ):
+                    for flag, country, label in buckets["reference"]:
+                        st.markdown(f"- {flag} {country} · {label}")
+
+            if buckets["unmapped"]:
+                with st.expander(
+                    f"Unmapped datasets ({len(buckets['unmapped'])}) — "
+                    f"not in our country mapping"
+                ):
+                    for ds in buckets["unmapped"]:
+                        st.markdown(f"- `{ds}`")
 
 with st.expander("🔍 Raw payload (debug)"):
     st.json(
