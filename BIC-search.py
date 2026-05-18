@@ -242,7 +242,7 @@ def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# External CBR directory fallback (bankirsha.com)
+# External CBR directory fallback chain
 # ---------------------------------------------------------------------------
 #
 # OpenSanctions indexes a `ru-bik-{BIK}` identifier on the parent legal entity
@@ -253,18 +253,158 @@ def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
 # OpenSanctions even though their parent legal entity is heavily
 # sanctioned.
 #
-# To screen those correctly we need a complete BIK directory. bankirsha.com
-# mirrors the CBR's BIK register and explicitly lists, for every branch
-# BIK, the parent's head-office BIK. We scrape that page and, if a head
-# office BIK is found, do a second OpenSanctions lookup against it.
+# To screen those correctly we need a complete BIK directory. We chain
+# multiple CBR directory mirrors because any single one may be unreachable
+# from the deployment IP range (bot protection, regional blocks, etc.).
+# Each mirror parses its own HTML shape and returns the same normalized
+# dict, so the calling code doesn't care which mirror responded.
 
-DIRECTORY_URL = "https://bankirsha.com/bik.{bik}.html"
+DIRECTORY_MIRRORS: list[dict] = [
+    {
+        "name": "bankirsha.com",
+        "url":  "https://bankirsha.com/bik.{bik}.html",
+    },
+    {
+        "name": "bik10.ru",
+        "url":  "https://bik10.ru/{bik}",
+    },
+    {
+        "name": "banklab.ru",
+        "url":  "https://www.banklab.ru/banks/bic/{bik}/",
+    },
+]
+
+
+def _strip_inner_tags(html_fragment: str) -> str:
+    """Strip HTML tags from a fragment and collapse whitespace."""
+    text = re.sub(r"<[^>]+>", "", html_fragment)
+    return re.sub(r"\s+", " ", unescape(text)).strip()
+
+
+def _parse_bankirsha(bik: str, html: str) -> dict | None:
+    """Parse bankirsha.com per-BIK page into our normalized dict shape."""
+    if bik not in html:
+        return None
+
+    def grab(pattern: str) -> str | None:
+        m = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+        return _strip_inner_tags(m.group(1)) if m else None
+
+    info: dict[str, str | None] = {"bik": bik, "_source": "bankirsha.com"}
+    fields = {
+        "name":      r"Наименование банка\s*</td>\s*<td[^>]*>(.+?)</td>",
+        "fullName":  r"Полное название\s*</td>\s*<td[^>]*>(.+?)</td>",
+        "type":      r"Тип организации\s*</td>\s*<td[^>]*>(.+?)</td>",
+        "regNumber": r"Регистрационный номер[^<]*</td>\s*<td[^>]*>(.+?)</td>",
+        "swift":     r"SWIFT[^<]*\)\s*</td>\s*<td[^>]*>(.+?)</td>",
+        "address":   r"Юридический адрес\s*</td>\s*<td[^>]*>(.+?)</td>",
+    }
+    for key, pat in fields.items():
+        val = grab(pat)
+        if val:
+            info[key] = val
+
+    head_match = re.search(
+        r"Головной офис[\s\S]{0,600}?bik\.(\d{9})\.html", html
+    )
+    if head_match and head_match.group(1) != bik:
+        info["headOfficeBik"] = head_match.group(1)
+
+    return info if (info.get("fullName") or info.get("name")) else None
+
+
+def _parse_bik10(bik: str, html: str) -> dict | None:
+    """Parse bik10.ru per-BIK page into our normalized dict shape.
+
+    bik10.ru uses a different HTML structure (multiple ``<table>`` blocks
+    with ``<td>label:</td><td>value</td>`` rows). The page also wraps the
+    bank name in the H1 title.
+    """
+    if bik not in html:
+        return None
+
+    def grab(pattern: str) -> str | None:
+        m = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+        return _strip_inner_tags(m.group(1)) if m else None
+
+    info: dict[str, str | None] = {"bik": bik, "_source": "bik10.ru"}
+
+    # Bank name from H1: "БИК NNN — Bank Name in city of City"
+    h1 = grab(r"<h1[^>]*>(.+?)</h1>")
+    if h1:
+        # "БИК 044525700 — АО \"Райффайзенбанк\" в городе Москве" → AO Raiffeisenbank
+        m = re.match(r"БИК\s*\d+\s*[—-]\s*(.+?)(?:\s+в\s+городе\s+.+)?$", h1)
+        info["name"] = m.group(1).strip() if m else h1
+
+    fields = {
+        "fullName":  r"Наименование:[^<]*</td>\s*<td[^>]*>(.+?)</td>",
+        "swift":     r"Код SWIFT:?\s*</td>\s*<td[^>]*>(.+?)</td>",
+        "regNumber": r"Регистрационный номер[^<]*</td>\s*<td[^>]*>(.+?)</td>",
+        "address":   r"Адрес:?\s*</td>\s*<td[^>]*>(.+?)</td>",
+        "type":      r"Тип организации:?\s*</td>\s*<td[^>]*>(.+?)</td>",
+    }
+    for key, pat in fields.items():
+        val = grab(pat)
+        if val and val != "—":
+            info[key] = val
+
+    # bik10.ru links the head-office BIK directly: href="/044525225"
+    head_match = re.search(
+        r"[Гг]оловн(?:ой|ого)[^<]{0,40}<a[^>]+href=\"/(\d{9})\"", html
+    )
+    if head_match and head_match.group(1) != bik:
+        info["headOfficeBik"] = head_match.group(1)
+
+    return info if (info.get("fullName") or info.get("name")) else None
+
+
+def _parse_banklab(bik: str, html: str) -> dict | None:
+    """Parse banklab.ru per-BIK page into our normalized dict shape."""
+    if bik not in html:
+        return None
+
+    def grab(pattern: str) -> str | None:
+        m = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+        return _strip_inner_tags(m.group(1)) if m else None
+
+    info: dict[str, str | None] = {"bik": bik, "_source": "banklab.ru"}
+
+    h1 = grab(r"<h1[^>]*>(.+?)</h1>")
+    if h1:
+        m = re.match(r"БИК\s*\d+\s*[—-]\s*(.+?)$", h1)
+        info["name"] = m.group(1).strip() if m else h1
+
+    fields = {
+        "fullName":  r"Полное\s+наименование[^<]*</td>\s*<td[^>]*>(.+?)</td>",
+        "swift":     r"SWIFT[^<]*</td>\s*<td[^>]*>(.+?)</td>",
+        "address":   r"Адрес[^<]*</td>\s*<td[^>]*>(.+?)</td>",
+    }
+    for key, pat in fields.items():
+        val = grab(pat)
+        if val and val != "—":
+            info[key] = val
+
+    head_match = re.search(
+        r"[Гг]оловн[^<]{0,40}<a[^>]+href=\"[^\"]*/(\d{9})/?\"", html
+    )
+    if head_match and head_match.group(1) != bik:
+        info["headOfficeBik"] = head_match.group(1)
+
+    return info if (info.get("fullName") or info.get("name")) else None
+
+
+_MIRROR_PARSERS = {
+    "bankirsha.com": _parse_bankirsha,
+    "bik10.ru":      _parse_bik10,
+    "banklab.ru":    _parse_banklab,
+}
 
 
 @st.cache_data(show_spinner=False, ttl=86400)  # cache a full day
 def resolve_bik_via_directory(bik: str) -> dict | None:
-    """Fetch BIK metadata from the bankirsha.com CBR directory mirror.
+    """Fetch BIK metadata from a chain of CBR directory mirrors.
 
+    Tries mirrors in priority order and returns the first successful parse.
     Returns a dict like::
 
         {
@@ -276,62 +416,29 @@ def resolve_bik_via_directory(bik: str) -> dict | None:
             "regNumber":     "1481/1309",
             "address":       "191124, САНКТ-ПЕТЕРБУРГ, УЛ КРАСНОГО ТЕКСТИЛЬЩИКА, 2",
             "headOfficeBik": "044525225",      # only present for branches
-            "_source":       "bankirsha.com",
+            "_source":       "bankirsha.com",  # which mirror responded
         }
 
-    or ``None`` if the page can't be reached or doesn't contain valid data.
-    Parsing is regex-based against the page's stable two-column table; if
-    bankirsha.com ever restructures the page we just fall back to "unknown".
+    or ``None`` if no mirror responds with usable data.
     """
-    url = DIRECTORY_URL.format(bik=bik)
-    try:
-        resp = requests.get(
-            url,
-            timeout=15,
-            headers=BROWSER_HEADERS,
-        )
-        resp.raise_for_status()
-    except requests.RequestException:
-        return None
+    for mirror in DIRECTORY_MIRRORS:
+        url = mirror["url"].format(bik=bik)
+        parser = _MIRROR_PARSERS.get(mirror["name"])
+        if not parser:
+            continue
+        try:
+            resp = requests.get(url, timeout=15, headers=BROWSER_HEADERS)
+            resp.raise_for_status()
+        except requests.RequestException:
+            continue
+        try:
+            info = parser(bik, resp.text)
+        except Exception:
+            info = None
+        if info:
+            return info
 
-    html = resp.text
-    # Safety: the page must contain the BIK we asked for
-    if bik not in html:
-        return None
-
-    def _grab(pattern: str) -> str | None:
-        m = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
-        return unescape(m.group(1)).strip() if m else None
-
-    info: dict[str, str | None] = {"bik": bik, "_source": "bankirsha.com"}
-
-    # Standard table fields. The page uses <td>Label</td><td>Value</td>.
-    # Values sometimes wrap in <a>/<span> — strip inner tags afterwards.
-    raw_fields = {
-        "name":      r"Наименование банка\s*</td>\s*<td[^>]*>(.+?)</td>",
-        "fullName":  r"Полное название\s*</td>\s*<td[^>]*>(.+?)</td>",
-        "type":      r"Тип организации\s*</td>\s*<td[^>]*>(.+?)</td>",
-        "regNumber": r"Регистрационный номер[^<]*</td>\s*<td[^>]*>(.+?)</td>",
-        "swift":     r"SWIFT[^<]*\)\s*</td>\s*<td[^>]*>(.+?)</td>",
-        "address":   r"Юридический адрес\s*</td>\s*<td[^>]*>(.+?)</td>",
-    }
-    for key, pat in raw_fields.items():
-        raw = _grab(pat)
-        if raw:
-            # Strip nested HTML tags from the captured cell
-            info[key] = re.sub(r"<[^>]+>", "", raw).strip() or None
-
-    # Head office BIK (only present for branch/division entries).
-    # The "Головной офис" section links to the parent's BIK page.
-    head_match = re.search(
-        r"Головной офис[\s\S]{0,600}?bik\.(\d{9})\.html", html
-    )
-    if head_match and head_match.group(1) != bik:
-        info["headOfficeBik"] = head_match.group(1)
-
-    if not (info.get("fullName") or info.get("name")):
-        return None
-    return info
+    return None
 
 
 def _synthetic_entity_from_directory(bik: str, info: dict) -> dict:
@@ -1248,8 +1355,8 @@ def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
             "• The BIK is invalid or a typo (must be 9 digits starting with 04).\n"
             "• The bank's licence was recently revoked and the entry was "
             "dropped from both OpenSanctions and the external CBR directory.\n"
-            "• The directory mirror (bankirsha.com) is temporarily "
-            "unreachable from your network.\n\n"
+            "• The directory mirrors (bankirsha.com / bik10.ru / banklab.ru) "
+            "are all temporarily unreachable from your network.\n\n"
             "Cross-check the BIK on opensanctions.org and on the CBR's own "
             "registry (cbr.ru) before acting on this result."
         )
@@ -1294,7 +1401,8 @@ def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
         verdict["status"] = "review"
         verdict["reasons"].insert(0, (
             "⚠️ This entity name suggests it's a **branch** of another bank, "
-            "but the CBR directory (bankirsha.com) was unreachable so we "
+            "but the CBR directory mirrors (bankirsha.com / bik10.ru / "
+            "banklab.ru) were all unreachable so we "
             "couldn't resolve to the head-office BIK. Branches inherit the "
             "sanctions status of their parent legal entity — verify the "
             "parent bank manually before trusting this verdict."
@@ -1413,13 +1521,18 @@ with st.sidebar:
         "**About**\n\n"
         "* BIK resolved via OpenSanctions `ru_cbr_banks` dataset "
         "(Central Bank of Russia registry, refreshed daily).\n"
-        "* Branch BIKs resolved via bankirsha.com → head-office BIK.\n"
+        "* Branch BIKs resolved to head office via a chain of CBR "
+        "directory mirrors: bankirsha.com → bik10.ru → banklab.ru. "
+        "First successful mirror wins.\n"
         "* Sanctions match via `/match` endpoint with `logic-v2` scoring.\n"
-        "* OhMySwift allowlist is applied as a **strict rule**: bank not on "
-        "list ⇒ treated as **sanctioned** (with a possible-false-positive "
-        "caveat for small banks). An OpenSanctions-confirmed sanction always "
-        "wins over the allowlist — covers more jurisdictions (UK, CA, JP, CH, "
-        "AU, UA) than OhMySwift's US-SDN + EU scope."
+        "* OhMySwift whitelist applied as a **hybrid rule**: bank on list "
+        "⇒ CLEAR; bank not on list AND OpenSanctions also clean ⇒ "
+        "REVIEW REQUIRED (rather than auto-sanctioned, because the list "
+        "is known to be incomplete for small regional banks). Live data "
+        "preferred; bundled snapshot used when ohmyswift.io is unreachable.\n"
+        "* An OpenSanctions-confirmed sanction always wins and is final. "
+        "OpenSanctions covers more jurisdictions (UK, CA, JP, CH, AU, UA) "
+        "than OhMySwift's US-SDN + EU scope."
     )
 
 # --- Main pane ------------------------------------------------------------
