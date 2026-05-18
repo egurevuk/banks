@@ -1136,6 +1136,48 @@ with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as
     bik_pool: set[str] = {bic}
     bik_pool.update(cbr.get("bik_codes") or [])
     bik_pool.update(enrichment_props.get("bikCode") or [])
+
+    # ── Special-case keyword routing ──────────────────────────────────────
+    # If the resolved bank name mentions SBERBANK or VTB, extend the BIK pool
+    # with the head-office BICs of those banks. This ensures the head-office
+    # entity is screened in OpenSanctions even when the entered BIC is a
+    # regional branch or affiliate whose own BIK doesn't appear in OS.
+    SPECIAL_BANK_HEAD_OFFICE_BICS: dict[str, list[str]] = {
+        "SBERBANK": ["044525225"],
+        "СБЕРБАНК": ["044525225"],
+        "VTB":      ["044030707", "044525187"],
+        "ВТБ":      ["044030707", "044525187"],
+    }
+    # Concatenate all available name variants and uppercase once for
+    # case-insensitive substring detection across Russian + transliterated forms.
+    name_haystack = " ".join(
+        n for n in [
+            name_ru, short_name_ru, name_en, short_name_en,
+            *(cbr.get("short_names_cbr") or []),
+            *(cbr.get("full_names_cbr") or []),
+        ] if n
+    ).upper()
+    extra_bics_added: list[tuple[str, str]] = []  # (matched_keyword, bic_added)
+    for keyword, head_office_bics in SPECIAL_BANK_HEAD_OFFICE_BICS.items():
+        if keyword in name_haystack:
+            for head_office_bic in head_office_bics:
+                if head_office_bic not in bik_pool:
+                    bik_pool.add(head_office_bic)
+                    extra_bics_added.append((keyword, head_office_bic))
+    if extra_bics_added:
+        extra_lines = "\n".join(
+            f"- `{b}` (matched `{kw}` in bank name)"
+            for kw, b in extra_bics_added
+        )
+        st.info(
+            f"📛 **Extended screening: {len(extra_bics_added)} additional "
+            f"head-office BIC(s) added** based on bank name detection:\n\n"
+            f"{extra_lines}\n\n"
+            "These BICs are sent to OpenSanctions alongside the entered BIC, "
+            "so the head-office legal entity is screened even when the "
+            "entered BIC belongs to a regional branch or affiliate."
+        )
+
     all_bics = sorted(bik_pool)
 
     kpp_pool: set[str] = set()
@@ -1205,6 +1247,21 @@ else:
         st.warning(f"{top_emoji} **{top_label}** — {top_reason}. Manual review required.")
     else:
         st.success(f"{top_emoji} **{top_label}** — {top_reason}. Likely false positive.")
+
+    # If the special-case keyword detection added head-office BICs in Step 3,
+    # surface that here too — the verdict section is the natural place for
+    # the analyst to see that screening coverage was extended beyond the
+    # entered BIC.
+    if extra_bics_added:
+        extras_summary = ", ".join(
+            f"`{b}` ({kw})" for kw, b in extra_bics_added
+        )
+        st.info(
+            f"📛 **Screening extended with {len(extra_bics_added)} additional "
+            f"head-office BIC(s):** {extras_summary}. "
+            "The candidates below may include the head-office legal entity "
+            "matched via these BICs, not just the originally-entered BIC."
+        )
 
     # ── Top-level Sanctioning Jurisdictions ────────────────────────────────
     # Surfaces the country breakdown from the BEST match (most severe by
