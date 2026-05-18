@@ -64,11 +64,6 @@ def transliterate_ru(text: str | None) -> str:
 CBR_SOAP_URL = "https://www.cbr.ru/CreditInfoWebServ/CreditOrgInfo.asmx"
 CBR_NS = {"w": "http://web.cbr.ru/"}
 BIK_INFO_URL = "https://bik-info.ru/api.html"
-OPENSANCTIONS_MATCH_URL = "https://api.opensanctions.org/match/default"
-
-# OpenSanctions match score thresholds (per their docs, ~0.7 is "probable match")
-SCORE_HIT = 0.70
-SCORE_REVIEW = 0.50
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -454,76 +449,61 @@ def opensanctions_get_entity(api_key: str, entity_id: str) -> dict[str, Any] | N
         return None
 
 
-def opensanctions_match(
+OPENSANCTIONS_SEARCH_URL = "https://api.opensanctions.org/search/"
+
+
+def opensanctions_search(
     api_key: str,
+    query: str,
     *,
-    names: list[str],
-    addresses: list[str],
-    swift_codes: list[str],
-    bik_codes: list[str],
-    inn: str | None = None,
-    ogrn: str | None = None,
-    reg_number: str | None = None,
-    kpp_codes: list[str] | None = None,
-    cutoff: float = 0.35,
+    scope: str = "default",
+    schema: str | None = "LegalEntity",
+    limit: int = 25,
+    countries: list[str] | None = None,
+    topics: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Query OpenSanctions /match/default with semantic identifier properties.
+    """Full-text search OpenSanctions — same behavior as the website search box.
 
-    Why semantic property names matter: OpenSanctions' matcher scores each
-    identifier type separately (swiftBic, bikCode, innCode, ogrnCode, kppCode
-    are all type `identifier` but with their own matchers). Stuffing the BIC
-    into `registrationNumber` works as a fallback but produces weaker scores
-    than putting it in the dedicated `bikCode` slot.
+    The /search endpoint runs an ElasticSearch query over entity names, aliases,
+    addresses, identifiers, etc. Returns the same shape of results the website's
+    search results page shows, ranked by relevancy.
 
-    Note: we pass *every* BIC and KPP from the CBR record (head office + all
-    branches), since OpenSanctions usually only stores the head-office BIK and
-    the user may have entered a branch BIC.
+    Parameters
+    ----------
+    api_key : str
+        OpenSanctions API key.
+    query : str
+        Text query. Supports ElasticSearch operators (~, AND, OR, NOT, quoted
+        phrases, field queries like `properties.swiftBic:VTBRRUMM`).
+    scope : str
+        Dataset collection. `default` covers everything; `sanctions` filters
+        to sanction-list entities only; `peps`, `crime`, etc. are narrower.
+    schema : str | None
+        Entity type filter. `LegalEntity` covers Company + Organization + Public
+        Body, which is what we want for banks. `Company` is narrower. None = all.
+    limit : int
+        Max results (default 25 — same as the website's first page).
     """
     if not api_key:
         return {"error": "OpenSanctions API key not configured"}
 
-    properties: dict[str, list[str]] = {
-        "name": [n for n in dict.fromkeys(names) if n],
-        "jurisdiction": ["Russia"],
-        "country": ["Russia"],
-    }
-    if addresses:
-        properties["address"] = [a for a in dict.fromkeys(addresses) if a]
-    if swift_codes:
-        properties["swiftBic"] = swift_codes
-    if bik_codes:
-        properties["bikCode"] = bik_codes
-    if kpp_codes:
-        properties["kppCode"] = kpp_codes
-    if inn:
-        properties["innCode"] = [inn]
-    if ogrn:
-        properties["ogrnCode"] = [ogrn]
-    if reg_number:
-        properties["registrationNumber"] = [reg_number]
-
-    body = {
-        "queries": {
-            "bank": {
-                "schema": "Company",
-                "properties": properties,
-            }
-        }
-    }
+    params: dict[str, Any] = {"q": query, "limit": limit}
+    if schema:
+        params["schema"] = schema
+    if countries:
+        params["countries"] = countries
+    if topics:
+        params["topics"] = topics
 
     try:
-        r = requests.post(
-            OPENSANCTIONS_MATCH_URL,
-            json=body,
-            params={"algorithm": "best", "cutoff": str(cutoff)},
-            headers={
-                "Authorization": f"ApiKey {api_key}",
-                "Content-Type": "application/json",
-            },
+        r = requests.get(
+            f"{OPENSANCTIONS_SEARCH_URL}{scope}",
+            params=params,
+            headers={"Authorization": f"ApiKey {api_key}"},
             timeout=30,
         )
         r.raise_for_status()
-        payload = r.json()
+        return r.json()
     except requests.HTTPError as e:
         return {
             "error": f"OpenSanctions HTTP {e.response.status_code}",
@@ -531,14 +511,6 @@ def opensanctions_match(
         }
     except Exception as e:
         return {"error": f"OpenSanctions request failed: {e}"}
-
-    responses = payload.get("responses", {})
-    bank_resp = responses.get("bank", {})
-    return {
-        "query": bank_resp.get("query"),
-        "results": bank_resp.get("results", []),
-        "sent_properties": properties,
-    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -582,14 +554,6 @@ NAME_STOPWORDS: set[str] = {
     "of", "the", "and", "for", "in", "at", "to", "by",
     "и", "или", "и/или", "по",
 }
-
-
-def tokenize_name(s: str | None) -> set[str]:
-    """Tokenize a bank name into distinctive tokens (lowercase, 3+ chars, non-stopword)."""
-    if not s:
-        return set()
-    words = re.findall(r"\w+", s.lower())
-    return {w for w in words if len(w) >= 3 and w not in NAME_STOPWORDS}
 
 
 def extract_parent_bank_names(branch_name: str | None) -> list[str]:
@@ -636,46 +600,69 @@ def extract_parent_bank_names(branch_name: str | None) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def name_token_overlap(input_names: list[str], candidate_props: dict) -> list[str]:
-    """Compute distinctive-token overlap between input and a candidate's names.
+# Topic codes from OpenSanctions' risk-tagging system. Mapping to display labels
+# with emoji prefixes mirrors the website's badge style.
+TOPIC_LABELS: dict[str, str] = {
+    "sanction": "🔴 Sanctioned",
+    "sanction.linked": "🟠 Sanction-linked",
+    "sanction.counter": "🟠 Counter-sanctioned",
+    "sanction.counter.linked": "🟠 Counter-sanction linked",
+    "debarment": "🟠 Debarred",
+    "asset.frozen": "🔴 Assets frozen",
+    "wanted": "🔴 Wanted",
+    "crime": "🟠 Crime-linked",
+    "crime.fraud": "🟠 Fraud",
+    "crime.cyber": "🟠 Cybercrime",
+    "crime.fin": "🟠 Financial crime",
+    "crime.theft": "🟠 Theft",
+    "crime.war": "🟠 War crimes",
+    "crime.boss": "🟠 Organised crime boss",
+    "crime.terror": "🔴 Terrorism",
+    "crime.traffick": "🟠 Trafficking",
+    "forced.labor": "🟠 Forced labor",
+    "role.pep": "🟡 PEP (politically exposed)",
+    "role.rca": "🟡 PEP close associate",
+    "role.judge": "🟡 Judge",
+    "role.civil": "🟡 Civil servant",
+    "role.diplo": "🟡 Diplomat",
+    "role.lead": "🟡 Political leader",
+    "role.spy": "🟡 Intelligence",
+    "role.oligarch": "🟡 Oligarch",
+    "poi": "🟡 Person of interest",
+    "fin": "🏦 Financial",
+    "fin.bank": "🏦 Bank",
+    "fin.fund": "🏦 Investment fund",
+    "fin.adivsor": "🏦 Financial advisor",
+    "corp.offshore": "🏠 Offshore company",
+    "corp.shell": "🏠 Shell company",
+    "corp.public": "🏛️ Publicly listed",
+    "reg.warn": "⚠️ Regulatory warning",
+    "reg.action": "⚠️ Regulatory action",
+    "export.control": "📦 Export-controlled",
+    "export.risk": "📦 Export risk",
+    "gov": "🏛️ Government",
+    "gov.national": "🏛️ National government",
+    "gov.muni": "🏛️ Municipal",
+    "gov.soe": "🏛️ State-owned enterprise",
+}
 
-    The candidate has many name fields (name, alias, previousName, weakAlias).
-    We tokenize them all + the input names, filter stopwords, and intersect.
-    A non-empty result means there's a distinctive bank name token they share —
-    a strong signal even when fuzzy name scoring is unimpressed.
-    """
-    candidate_names: list[str] = []
-    for key in ("name", "alias", "previousName", "weakAlias"):
-        v = candidate_props.get(key)
-        if not v:
-            continue
-        candidate_names.extend(v if isinstance(v, list) else [v])
-
-    input_tokens: set[str] = set()
-    for n in input_names:
-        input_tokens |= tokenize_name(n)
-
-    candidate_tokens: set[str] = set()
-    for n in candidate_names:
-        candidate_tokens |= tokenize_name(n)
-
-    return sorted(input_tokens & candidate_tokens)
+# Topic codes that indicate the entity carries some kind of compliance risk.
+# Used to categorize results into 🔴 sanctioned / 🟡 risk / no-tag groups.
+SANCTION_TOPICS = {"sanction", "sanction.linked", "sanction.counter", "sanction.counter.linked", "asset.frozen", "wanted"}
+RISK_TOPICS = {"debarment", "crime", "crime.fraud", "crime.cyber", "crime.fin", "crime.theft",
+               "crime.war", "crime.boss", "crime.terror", "crime.traffick", "forced.labor",
+               "role.pep", "role.rca", "role.oligarch", "role.spy", "poi",
+               "reg.warn", "reg.action", "export.control", "export.risk"}
 
 
-def compute_verdict(score: float, token_overlap: list[str]) -> tuple[str, str, str]:
-    """(label, emoji, reason) for a single candidate. Score and token overlap
-    are independent signals — token overlap can escalate verdict on its own."""
-    if score >= SCORE_HIT:
-        return ("MATCH", "🔴", f"score {score:.2f} ≥ {SCORE_HIT:.2f}")
-    if score >= SCORE_REVIEW:
-        return ("REVIEW", "🟡", f"score {score:.2f} ≥ {SCORE_REVIEW:.2f}")
-    if token_overlap:
-        return (
-            "REVIEW",
-            "🟡",
-            f"name token overlap: {', '.join(token_overlap)} (score {score:.2f} alone is below review)",
-        )
-    return ("LIKELY CLEAR", "🟢", f"score {score:.2f}, no name overlap")
+def categorize_result(result: dict[str, Any]) -> str:
+    """Bucket a search result into 'sanctioned', 'risk', or 'context' by topics."""
+    topics = set(result.get("properties", {}).get("topics", []) or [])
+    if topics & SANCTION_TOPICS:
+        return "sanctioned"
+    if topics & RISK_TOPICS:
+        return "risk"
+    return "context"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -690,8 +677,8 @@ st.set_page_config(
 
 st.title("🏦 BIC Bank Screening")
 st.caption(
-    "Resolve a Russian BIC to bank details and screen against OpenSanctions. "
-    "Sources: CBR SOAP (`BicToIntCode` → `CreditInfoByIntCodeExXML`), bik-info.ru, OpenSanctions `/match`."
+    "Resolve a Russian BIC to bank details and search OpenSanctions by name "
+    "(same behavior as the website search). Sources: CBR SOAP, bik-info.ru, OpenSanctions `/search`."
 )
 
 with st.sidebar:
@@ -704,10 +691,10 @@ with st.sidebar:
             "`.streamlit/secrets.toml` or env var `OPENSANCTIONS_API_KEY`."
         )
     st.markdown(
-        "**Score thresholds**  \n"
-        f"🔴 Match: ≥ {SCORE_HIT:.2f}  \n"
-        f"🟡 Review: ≥ {SCORE_REVIEW:.2f}  \n"
-        "🟢 Likely clear: below"
+        "**Result categorisation**  \n"
+        "🔴 Sanctioned — any sanction topic  \n"
+        "🟡 Risk-tagged — PEP, debarment, crime, regulatory, export-control  \n"
+        "⚪ Context — no risk tags (informational only)"
     )
 
 col1, col2 = st.columns([3, 1])
@@ -863,193 +850,224 @@ with st.status("Step 2 · bik-info.ru: bank name & address + transliteration", e
     status.update(label="Step 2 · Bank identified", state="complete")
 
 # ─── STEP 3 ──────────────────────────────────────────────────────────────────
-with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as status:
-    # Pre-step: pull the ru_cbr_banks reference entity from OpenSanctions for
-    # this BIC. Branches share OGRN/INN with their parent legal entity, so
-    # even when CBR's SOAP API can't resolve a branch BIC, OS's own copy of
-    # the Russian banking registry gives us the parent identifiers directly.
-    enrichment_props: dict[str, list[str]] = {}
-    enrichment_source = None
-    os_ref = opensanctions_get_entity(OPENSANCTIONS_API_KEY, f"ru-bik-{bic}")
-    if os_ref and isinstance(os_ref, dict) and "properties" in os_ref:
-        enrichment_props = os_ref.get("properties") or {}
-        enrichment_source = f"ru-bik-{bic}"
-        st.success(
-            f"✓ Found OpenSanctions reference entity `{enrichment_source}` "
-            f"({os_ref.get('caption') or 'unnamed'}) — enriching query with its identifiers"
-        )
-    else:
-        st.caption(f"(no `ru-bik-{bic}` reference entity in OpenSanctions — using CBR + bik-info.ru only)")
+with st.status("Step 3 · OpenSanctions /search — search by name", expanded=True) as status:
+    # Build candidate search queries. Order matters — most distinctive first.
+    # Each query is a (label, query_string) tuple. We'll run them in order
+    # until we get useful results, then dedupe by entity ID.
+    queries: list[tuple[str, str]] = []
 
-    # Pull every name variant from all sources, RU + transliterated
-    name_pool: set[str] = set()
-    name_pool.update([name_ru, short_name_ru, name_en, short_name_en])
-    for n in (cbr.get("short_names_cbr") or []) + (cbr.get("full_names_cbr") or []):
-        name_pool.add(n)
-        name_pool.add(transliterate_ru(n))
-    # OS reference entity names — these often include the parent's canonical name
-    for n in enrichment_props.get("name") or []:
-        name_pool.add(n)
-        name_pool.add(transliterate_ru(n))
-
-    # Extract parent bank name from branch-naming patterns
-    # ("Филиал X Банка Y" → "Y"). This is a massive score booster for branches
-    # — without it, fuzzy name matching only sees the branch's full noun phrase
-    # ("Filial Tsentral'nyj Banka VTB PAO") vs the parent's primary name ("VTB BANK OAO"),
-    # which only share one distinctive token after stopword removal.
-    parent_names: set[str] = set()
-    for source_name in [name_ru, short_name_ru, name_en, short_name_en] + (cbr.get("short_names_cbr") or []) + (cbr.get("full_names_cbr") or []):
+    # 1. Extracted parent bank name (most distinctive — e.g. "ВТБ", "VTB")
+    parent_names: list[str] = []
+    for source_name in [name_ru, short_name_ru, name_en, short_name_en] + (
+        cbr.get("short_names_cbr") or []
+    ) + (cbr.get("full_names_cbr") or []):
         for p in extract_parent_bank_names(source_name):
-            parent_names.add(p)
-            parent_names.add(transliterate_ru(p))
+            if p not in parent_names:
+                parent_names.append(p)
+            tr = transliterate_ru(p)
+            if tr and tr != p and tr not in parent_names:
+                parent_names.append(tr)
     if parent_names:
         st.caption(
-            f"📛 Extracted parent bank name(s) from branch name: "
-            + ", ".join(f"`{p}`" for p in sorted(parent_names))
+            "📛 Extracted parent bank name(s) from branch name: "
+            + ", ".join(f"`{p}`" for p in parent_names)
         )
-        name_pool |= parent_names
+        # OR-joined query covers both scripts in one call
+        joined = " OR ".join(parent_names)
+        queries.append(("parent bank name", joined))
 
-    names = [n for n in name_pool if n]
+    # 2. CBR short name (head-office name, when CBR resolved)
+    for n in cbr.get("short_names_cbr") or []:
+        if n:
+            queries.append(("CBR short name", n))
+            break  # one is enough
 
-    # Every address variant from all sources, RU + transliterated
-    addr_pool: set[str] = set()
-    addr_pool.update([address_ru, address_en])
-    for a in (cbr.get("addresses_cbr") or []):
-        addr_pool.add(a)
-        addr_pool.add(transliterate_ru(a))
-    for a in enrichment_props.get("address") or []:
-        addr_pool.add(a)
-    addresses = [a for a in addr_pool if a]
+    # 3. bik-info.ru short name
+    if short_name_ru and short_name_ru not in [q[1] for q in queries]:
+        queries.append(("bik-info short name", short_name_ru))
 
-    # Identifiers: prefer existing sources, fall back to OS reference enrichment
-    inn_final = inn or cbr.get("inn_cbr") or (enrichment_props.get("innCode") or [None])[0]
-    ogrn_final = (
-        bi.get("ogrn")
-        or cbr.get("ogrn_cbr")
-        or (enrichment_props.get("ogrnCode") or [None])[0]
-    )
-    reg_final = cbr.get("regn_cbr") or (enrichment_props.get("registrationNumber") or [None])[0]
+    # 4. Full bank name from bik-info.ru (broad fallback)
+    if name_ru and name_ru not in [q[1] for q in queries]:
+        queries.append(("bik-info full name", name_ru))
 
-    # Pass ALL BIKs and KPPs (head office + branches + anything OS has on file)
-    bik_pool: set[str] = set([bic])
-    bik_pool.update(cbr.get("bik_codes") or [])
-    bik_pool.update(enrichment_props.get("bikCode") or [])
-    all_bics = sorted(bik_pool)
-
-    kpp_pool: set[str] = set()
-    kpp_pool.update(cbr.get("kpp_codes_cbr") or [])
-    if kpp:
-        kpp_pool.add(kpp)
-    kpp_pool.update(enrichment_props.get("kppCode") or [])
-    all_kpps = sorted(kpp_pool)
-
-    # SWIFTs: combine CBR-extracted + any in the OS reference entity
-    swift_pool: set[str] = set(cbr.get("swift_codes") or [])
-    for s in enrichment_props.get("swiftBic") or []:
-        swift_pool.add(s.upper())
-        # Also synthesize the alternate length so both forms reach the matcher
-        if len(s) == 8:
-            swift_pool.add(s.upper() + "XXX")
-        elif len(s) == 11:
-            swift_pool.add(s[:8].upper())
-    all_swifts = sorted(swift_pool)
-
-    os_result = opensanctions_match(
-        OPENSANCTIONS_API_KEY,
-        names=names,
-        addresses=addresses,
-        swift_codes=all_swifts,
-        bik_codes=all_bics,
-        inn=inn_final,
-        ogrn=ogrn_final,
-        reg_number=reg_final,
-        kpp_codes=all_kpps,
-    )
-    if os_result.get("error"):
-        st.error(os_result["error"])
-        if os_result.get("detail"):
-            st.code(os_result["detail"])
-        status.update(label=f"Step 3 · {os_result['error']}", state="error")
+    if not queries:
+        st.error("No name to search with. CBR and bik-info.ru both returned nothing.")
+        status.update(label="Step 3 · nothing to search", state="error")
         st.stop()
 
-    results = os_result.get("results", [])
-    with st.expander("Query sent to OpenSanctions"):
-        st.json(os_result.get("sent_properties", {}))
-    status.update(label=f"Step 3 · {len(results)} candidate(s) returned", state="complete")
+    # Let the user override the query
+    primary_label, primary_query = queries[0]
+    user_query = st.text_input(
+        "🔍 Search query (edit to refine, then press Enter to re-search)",
+        value=primary_query,
+        help="Default = the most distinctive name we extracted. "
+        "Supports `OR`, `AND`, `NOT`, and ElasticSearch fuzzy operators like `Aliyev~2`.",
+    )
+
+    # Always run with whatever's in the input box (Enter triggers re-run)
+    with st.spinner(f"Searching OpenSanctions for `{user_query}`…"):
+        search_result = opensanctions_search(OPENSANCTIONS_API_KEY, user_query, limit=25)
+
+    if search_result.get("error"):
+        st.error(search_result["error"])
+        if search_result.get("detail"):
+            st.code(search_result["detail"])
+        status.update(label=f"Step 3 · {search_result['error']}", state="error")
+        st.stop()
+
+    results = search_result.get("results", []) or []
+    total = search_result.get("total")
+    if isinstance(total, dict):
+        total_count = total.get("value", len(results))
+        total_rel = total.get("relation", "eq")
+    else:
+        total_count = total or len(results)
+        total_rel = "eq"
+    total_label = f"{total_count}{'+' if total_rel == 'gte' else ''}"
+
+    st.write(
+        f"**{total_label}** total hit(s) — showing top **{len(results)}** ranked by relevance."
+    )
+
+    with st.expander("🔧 Alternative queries to try"):
+        st.caption("Click to copy any of these into the search box above:")
+        for label, q in queries:
+            st.code(q, language="text")
+            st.caption(f"_({label})_")
+
+    status.update(
+        label=f"Step 3 · {len(results)} result(s) from /search",
+        state="complete",
+    )
 
 # ─── STEP 4 ──────────────────────────────────────────────────────────────────
-st.markdown("## Step 4 · Verdict")
+st.markdown("## Step 4 · Results")
 
 if not results:
-    st.success("🟢 **No matches in OpenSanctions** — no candidate entities returned for this bank.")
+    st.success(f"🟢 **No matches in OpenSanctions** for query `{user_query}`.")
+    st.stop()
+
+# Categorize results by risk topic
+sanctioned: list[dict] = []
+risky: list[dict] = []
+context: list[dict] = []
+for r in results:
+    bucket = categorize_result(r)
+    if bucket == "sanctioned":
+        sanctioned.append(r)
+    elif bucket == "risk":
+        risky.append(r)
+    else:
+        context.append(r)
+
+# Top-level summary
+if sanctioned:
+    st.error(
+        f"🔴 **{len(sanctioned)} SANCTIONED entity(ies) found** — "
+        f"do not transact without compliance review."
+    )
+elif risky:
+    st.warning(
+        f"🟡 **{len(risky)} risk-tagged entity(ies) found** — manual review recommended."
+    )
 else:
-    # Compute per-candidate verdicts using both score and name-token overlap
-    candidate_verdicts = []
-    for r in results:
-        score = r.get("score") or 0
-        props = r.get("properties", {})
-        overlap = name_token_overlap(names, props)
-        label, emoji, reason = compute_verdict(score, overlap)
-        candidate_verdicts.append((r, score, overlap, label, emoji, reason))
+    st.info(
+        f"ℹ️ **{len(context)} entity(ies) returned**, none carry sanction or risk tags."
+    )
 
-    # Overall verdict = worst (most severe) of all candidates
-    severity = {"MATCH": 3, "REVIEW": 2, "LIKELY CLEAR": 1}
-    candidate_verdicts.sort(key=lambda t: (severity[t[3]], t[1]), reverse=True)
-    _, top_score, top_overlap, top_label, top_emoji, top_reason = candidate_verdicts[0]
 
-    if top_label == "MATCH":
-        st.error(
-            f"{top_emoji} **{top_label}** — {top_reason}. Investigate before transacting."
-        )
-    elif top_label == "REVIEW":
-        st.warning(
-            f"{top_emoji} **{top_label}** — {top_reason}. Manual review required."
+def render_entity(r: dict[str, Any]) -> None:
+    """Render a single search result, styled like the OpenSanctions website."""
+    caption = r.get("caption") or "(no name)"
+    eid = r.get("id")
+    schema = r.get("schema") or ""
+    props = r.get("properties") or {}
+    topics = props.get("topics") or []
+    datasets = r.get("datasets") or []
+
+    badges = [TOPIC_LABELS.get(t, t) for t in topics]
+
+    # Header with link to OpenSanctions website
+    if eid:
+        st.markdown(
+            f"#### [{caption}](https://www.opensanctions.org/entities/{eid}/)"
         )
     else:
-        st.success(
-            f"{top_emoji} **{top_label}** — {top_reason}. Likely false positive."
-        )
+        st.markdown(f"#### {caption}")
 
-    st.markdown("### Candidates")
-    for r, score, overlap, label, emoji, reason in candidate_verdicts:
-        title_extra = f" · 🔗 overlap: {', '.join(overlap)}" if overlap else ""
-        with st.expander(
-            f"{emoji}  {r.get('caption', '(no caption)')}  ·  score {score:.3f}{title_extra}"
-        ):
-            cols = st.columns([1, 2])
-            with cols[0]:
-                st.write("**Verdict:**", f"{emoji} {label}")
-                st.write("**Reason:**", reason)
-                st.write("**ID:**", r.get("id"))
-                st.write("**Schema:**", r.get("schema"))
-                st.write("**Score:**", f"{score:.4f}")
-                st.write("**Match?**", r.get("match"))
-                if overlap:
-                    st.write("**Name overlap:**", ", ".join(f"`{t}`" for t in overlap))
-                if r.get("datasets"):
-                    st.write("**Datasets:**")
-                    for d in r["datasets"]:
-                        st.write(f"- `{d}`")
-            with cols[1]:
-                props = r.get("properties", {})
-                relevant_keys = [
-                    "name", "alias", "address", "country", "jurisdiction",
-                    "registrationNumber", "swiftBic", "innCode", "ogrnCode",
-                    "topics", "program", "sanctions",
-                ]
-                shown = {k: props[k] for k in relevant_keys if k in props}
-                if shown:
-                    st.write("**Properties:**")
-                    st.json(shown)
-                rid = r.get("id")
-                if rid:
-                    st.markdown(f"[Open in OpenSanctions ↗](https://opensanctions.org/entities/{rid}/)")
+    meta_line = f"`{schema}`"
+    if badges:
+        meta_line += " · " + " · ".join(badges)
+    st.caption(meta_line)
+
+    # Aliases — what the website shows under "also known as"
+    aliases = (props.get("alias") or [])[:5]
+    name_list = props.get("name") or []
+    other_names = [n for n in name_list + aliases if n != caption][:5]
+    if other_names:
+        st.caption("Also known as: " + " · ".join(other_names))
+
+    # Country / jurisdiction
+    countries = props.get("country") or props.get("jurisdiction") or []
+    if countries:
+        st.caption("Jurisdiction: " + ", ".join(countries))
+
+    # Key identifiers in a tidy row
+    id_chips = []
+    for prop, label in [
+        ("swiftBic", "SWIFT"),
+        ("bikCode", "BIK"),
+        ("innCode", "INN"),
+        ("ogrnCode", "OGRN"),
+        ("leiCode", "LEI"),
+        ("registrationNumber", "Reg №"),
+    ]:
+        vals = props.get(prop) or []
+        if vals:
+            id_chips.append(f"**{label}:** " + ", ".join(f"`{v}`" for v in vals[:3]))
+    if id_chips:
+        st.markdown(" · ".join(id_chips))
+
+    with st.expander(f"Full details · {len(datasets)} dataset(s)"):
+        if datasets:
+            st.markdown("**Datasets** _(source watchlists this entity appears on)_:")
+            for d in datasets:
+                st.markdown(f"- `{d}`")
+        st.markdown("**All entity properties:**")
+        st.json(props)
+
+
+# Display by risk bucket — most severe first
+if sanctioned:
+    st.markdown("### 🔴 Sanctioned Entities")
+    for r in sanctioned:
+        with st.container(border=True):
+            render_entity(r)
+
+if risky:
+    st.markdown("### 🟡 Risk-tagged Entities")
+    for r in risky:
+        with st.container(border=True):
+            render_entity(r)
+
+if context:
+    with st.expander(
+        f"⚪ Other matches without risk tags ({len(context)}) — informational only"
+    ):
+        for r in context:
+            with st.container(border=True):
+                render_entity(r)
 
 with st.expander("🔍 Raw payload (debug)"):
     st.json(
         {
             "cbr": cbr,
             "bik_info": bi,
-            "opensanctions": os_result,
+            "opensanctions_search": {
+                "query": user_query,
+                "total": total,
+                "n_results": len(results),
+                "first_result": results[0] if results else None,
+            },
         }
     )
