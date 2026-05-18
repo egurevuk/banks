@@ -131,6 +131,40 @@ def _entity_contains_bik(entity: dict, bik: str) -> bool:
     return False
 
 
+# Russian/English markers that an entity name describes a branch (filial),
+# not the head office legal entity. Used as a fallback branch detector when
+# bankirsha.com is unreachable.
+_BRANCH_NAME_MARKERS = (
+    "ФИЛИАЛ",     # filial (Russian)
+    "FILIAL",     # filial (transliterated)
+    "BRANCH",     # branch (English)
+    "ОТДЕЛЕНИЕ",  # otdelenie = subdivision
+    "ОФИС",       # office
+)
+
+
+def looks_like_branch_entity(entity: dict) -> bool:
+    """Heuristic: does this OpenSanctions entity describe a branch of a bank?
+
+    Falls back to name pattern matching when the structural CBR directory
+    (bankirsha.com) is unreachable. Returns True only if a clear branch
+    marker is present in the entity's name or caption.
+    """
+    if not entity:
+        return False
+    candidates: list[str] = []
+    candidates.append(str(entity.get("caption") or ""))
+    props = entity.get("properties", {}) or {}
+    for key in ("name", "alias", "previousName"):
+        for v in (props.get(key) or []):
+            candidates.append(str(v))
+    for txt in candidates:
+        upper = txt.upper()
+        if any(marker in upper for marker in _BRANCH_NAME_MARKERS):
+            return True
+    return False
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
     """Resolve a Russian BIK to an OpenSanctions entity — strict, no guessing.
@@ -1095,32 +1129,55 @@ def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
     if bank:
         result["resolved_via"] = "OpenSanctions index (direct BIK match)"
 
-    # ---- Stage 2: external CBR directory fallback for branch BIKs --------
-    if not bank:
-        info = resolve_bik_via_directory(bik)
-        if info:
-            result["directory_info"] = info
-            # 2a. Branch with a head-office BIK pointer → re-query OpenSanctions
-            head_bik = info.get("headOfficeBik")
-            if head_bik:
-                try:
-                    head_bank = lookup_bank_in_cbr_registry(head_bik, api_key)
-                except Exception:
-                    head_bank = None
-                if head_bank:
-                    bank = head_bank
-                    result["resolved_via"] = (
-                        f"CBR directory → head-office BIK {head_bik} "
-                        f"(branch \"{info.get('fullName') or info.get('name')}\" "
-                        f"of this legal entity)"
-                    )
-            # 2b. Otherwise build a synthetic entity from the directory data
-            if not bank:
-                bank = _synthetic_entity_from_directory(bik, info)
+    # ---- Stage 2: consult CBR directory to detect branch BIKs -----------
+    #
+    # OpenSanctions' ru_cbr_banks dataset has SEPARATE entries for every
+    # branch BIK (e.g. 044030653 = Sberbank Severo-Zapadny branch is its own
+    # entity, distinct from the head office at 044525225). The branch entity
+    # is NOT directly tagged as sanctioned even though its parent is, which
+    # would produce a false-negative CLEAR verdict for branches of sanctioned
+    # banks. So we ALWAYS consult bankirsha.com — even when Stage 1 found
+    # something — to detect a branch relationship and re-resolve to the
+    # head office.
+    info = resolve_bik_via_directory(bik)
+    if info:
+        result["directory_info"] = info
+        head_bik = info.get("headOfficeBik")
+        if head_bik and head_bik != bik:
+            # It's a branch — re-query OpenSanctions for the head-office BIK
+            # and use that as the bank for the verdict. Branch BIKs inherit
+            # the head office's sanctions status.
+            try:
+                head_bank = lookup_bank_in_cbr_registry(head_bik, api_key)
+            except Exception:
+                head_bank = None
+            if head_bank:
+                branch_label = info.get("fullName") or info.get("name") or "branch"
+                bank = head_bank
                 result["resolved_via"] = (
-                    "CBR directory (not indexed by OpenSanctions; "
-                    "/match performed by name + SWIFT)"
+                    f"Branch BIK {bik} (\"{branch_label}\") → head-office "
+                    f"BIK {head_bik}. Branch inherits the head office's "
+                    f"sanctions status."
                 )
+                result["is_branch"] = True
+                result["head_office_bik"] = head_bik
+
+    # ---- Stage 3: build a synthetic entity if we still have nothing -----
+    if not bank and info:
+        bank = _synthetic_entity_from_directory(bik, info)
+        result["resolved_via"] = (
+            "CBR directory (not indexed by OpenSanctions; "
+            "/match performed by name + SWIFT)"
+        )
+
+    # ---- Stage 4: safety net for branches we couldn't auto-resolve -----
+    # If the entity name still looks like a branch (e.g. starts with
+    # "ФИЛИАЛ" / "BRANCH") but we never swapped to a head office — usually
+    # because bankirsha.com was unreachable — flag this for the UI so the
+    # verdict isn't silently trusted. Classify will downgrade the verdict
+    # to REVIEW with a clear note.
+    if bank and not result.get("is_branch") and looks_like_branch_entity(bank):
+        result["branch_unresolved"] = True
 
     if not bank:
         result["status"] = "unknown"
@@ -1165,6 +1222,22 @@ def screen_bik(bik_raw: str, api_key: str, scope: str) -> dict:
     result["whitelist"] = whitelist_check
 
     verdict = classify(result["bank_full"], match_response, whitelist=whitelist_check)
+
+    # If we detected this BIK as a branch but couldn't resolve the head
+    # office (bankirsha unreachable, etc.), don't trust a CLEAR/REVIEW
+    # verdict — the branch entity itself isn't usually tagged with the
+    # parent's sanctions. Downgrade to REVIEW with a clear explanation,
+    # unless we already have a hard SANCTIONED signal.
+    if result.get("branch_unresolved") and verdict["status"] != "sanctioned":
+        verdict["status"] = "review"
+        verdict["reasons"].insert(0, (
+            "⚠️ This entity name suggests it's a **branch** of another bank, "
+            "but the CBR directory (bankirsha.com) was unreachable so we "
+            "couldn't resolve to the head-office BIK. Branches inherit the "
+            "sanctions status of their parent legal entity — verify the "
+            "parent bank manually before trusting this verdict."
+        ))
+
     result["verdict"] = verdict
     result["status"] = verdict["status"]
     return result
