@@ -36,6 +36,21 @@ REQUEST_TIMEOUT = 30
 SANCTION_SCORE_THRESHOLD = 0.70         # below this we don't alert
 STRONG_SCORE_THRESHOLD = 0.85           # above this we treat as confirmed
 
+# Realistic browser UA. Custom UAs (e.g. "BIK-Screener/1.0") get 403'd by
+# bot-protection on bankirsha.com and ohmyswift.io when the request
+# originates from cloud IPs (Streamlit Cloud, etc.). Used by every
+# third-party scraper in the app.
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+BROWSER_HEADERS = {
+    "User-Agent": BROWSER_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+}
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -129,23 +144,46 @@ def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
 
     The fix:
 
-    1. Try precise field-scoped lookups in order. The most reliable is the
-       source-ID lookup ``referents:"ru-bik-{BIK}"`` on the ``default``
-       scope, which catches both standalone entities in the CBR registry
-       AND deduplicated sanctioned entities that carry the BIK as a
-       source ID. We then fall back to identifier-field lookups, and
-       finally a scoped text query inside the CBR registry.
-    2. *Strictly* validate every candidate via :func:`_entity_contains_bik`.
+    1. Try the direct ``/entities/ru-bik-{BIK}`` lookup first — OpenSanctions
+       resolves source IDs to the canonical deduplicated entity, so this
+       catches sanctioned banks like JSC Tinkoff Bank where the BIK is a
+       referent of the sanctioned entity, not the entity ID itself.
+    2. Then try precise field-scoped Lucene searches in order, across both
+       the ``default`` and ``sanctions`` scopes. This is the fallback for
+       cases where the direct entity-ID lookup doesn't resolve.
+    3. *Strictly* validate every candidate via :func:`_entity_contains_bik`.
        Never return an entity that doesn't actually contain this BIK.
-    3. No fuzzy ``results[0]`` fallback — better to report "unknown" than
+    4. No fuzzy ``results[0]`` fallback — better to report "unknown" than
        to mis-attribute sanctions to the wrong institution.
     """
+    # --- Step 1: direct entity-by-referent lookup --------------------------
+    # OpenSanctions' /entities/{id} endpoint accepts source IDs too — so
+    # GET /entities/ru-bik-044525974 returns the canonical (possibly
+    # deduplicated and sanctions-tagged) entity directly.
+    try:
+        resp = requests.get(
+            f"{OS_BASE}/entities/ru-bik-{bik}",
+            params={"nested": "false"},
+            headers=os_headers(api_key),
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 200:
+            entity = resp.json()
+            if entity and _entity_contains_bik(entity, bik):
+                return entity
+        # 404 is the expected miss — fall through to /search
+    except requests.RequestException:
+        pass
+
+    # --- Step 2: Lucene-based /search across both scopes -------------------
     attempts: list[tuple[str, str]] = [
         # (scope, lucene query) — most specific first
-        ("default",     f'referents:"ru-bik-{bik}"'),
-        ("default",     f'identifiers:"{bik}"'),
-        (BANKS_DATASET, f'identifiers:"{bik}"'),
-        (BANKS_DATASET, bik),  # text-mode fallback inside the CBR dataset only
+        ("default",       f'referents:"ru-bik-{bik}"'),
+        ("sanctions",     f'referents:"ru-bik-{bik}"'),
+        ("default",       f'identifiers:"{bik}"'),
+        ("sanctions",     f'identifiers:"{bik}"'),
+        (BANKS_DATASET,   f'identifiers:"{bik}"'),
+        (BANKS_DATASET,   bik),  # text-mode fallback inside the CBR dataset only
     ]
 
     for scope, q in attempts:
@@ -187,7 +225,6 @@ def lookup_bank_in_cbr_registry(bik: str, api_key: str) -> dict | None:
 # office BIK is found, do a second OpenSanctions lookup against it.
 
 DIRECTORY_URL = "https://bankirsha.com/bik.{bik}.html"
-DIRECTORY_UA = "Mozilla/5.0 (BIK-Screener; +github.com/anthropics/claude-code)"
 
 
 @st.cache_data(show_spinner=False, ttl=86400)  # cache a full day
@@ -217,7 +254,7 @@ def resolve_bik_via_directory(bik: str) -> dict | None:
         resp = requests.get(
             url,
             timeout=15,
-            headers={"User-Agent": DIRECTORY_UA, "Accept-Language": "ru,en"},
+            headers=BROWSER_HEADERS,
         )
         resp.raise_for_status()
     except requests.RequestException:
@@ -315,12 +352,6 @@ def _synthetic_entity_from_directory(bik: str, info: dict) -> dict:
 # We therefore raise REVIEW rather than SANCTIONED when a bank is missing.
 
 OHMYSWIFT_URL = "https://ohmyswift.io/ne-pod-sankciyami-spisok"
-# Use a realistic browser UA — the custom 'BIK-Screener' UA gets 403'd by
-# ohmyswift.io's bot protection from cloud IPs (Streamlit Cloud, etc.).
-OHMYSWIFT_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-)
 
 
 def _normalize_swift(code: str) -> str:
@@ -348,13 +379,7 @@ def fetch_ohmyswift_whitelist() -> dict | None:
         resp = requests.get(
             OHMYSWIFT_URL,
             timeout=20,
-            headers={
-                "User-Agent": OHMYSWIFT_UA,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ru,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Cache-Control": "no-cache",
-            },
+            headers={**BROWSER_HEADERS, "Cache-Control": "no-cache"},
         )
         resp.raise_for_status()
     except requests.RequestException as exc:
@@ -573,23 +598,26 @@ def classify(
     """Combine entity-level evidence, /match evidence, and the OhMySwift
     whitelist into a final verdict.
 
-    Decision logic (in order):
+    Decision logic (in order) — implements the user's **strict allowlist
+    rule**: a bank not on the OhMySwift list is treated as sanctioned.
 
       1. **OpenSanctions confirmed sanction** (any list — US, EU, UK, CA, JP,
-         CH, AU, UA, etc.) — verdict is SANCTIONED. This wins over the
-         whitelist because OpenSanctions covers more jurisdictions than the
-         US-SDN-and-EU-only OhMySwift list.
+         CH, AU, UA, etc.) → SANCTIONED. This wins over the whitelist because
+         OpenSanctions covers more jurisdictions than OhMySwift's US-SDN+EU
+         scope, so it can flag a bank that happens to appear on the OhMySwift
+         allowlist (e.g. a bank on the UK list only).
       2. **In OhMySwift whitelist** and no OpenSanctions hit → CLEAR (with a
-         caveat that the list covers only US SDN + EU).
+         scope caveat — covers US SDN + EU only).
       3. **Not in OhMySwift whitelist** (and not OpenSanctions-confirmed) →
-         REVIEW REQUIRED. The OhMySwift list is known to be incomplete (it
-         misses small regional banks like Bank Yekaterinburg even though they
-         are not actually sanctioned), so a missing-from-whitelist signal
-         alone is not strong enough to declare SANCTIONED. The reason text
-         explains the conflict and recommends checking the official OFAC /
-         EU lists directly.
+         SANCTIONED. Per the strict allowlist rule: outside the list ⇒
+         treated as sanctioned. The reason text flags possible false
+         positives (small regional banks the list may have missed) and
+         recommends manual verification against the official OFAC SDN / EU
+         consolidated lists.
       4. **Whitelist unavailable** (couldn't fetch the page) → fall back to
-         the prior OpenSanctions-only behaviour with a REVIEW threshold.
+         OpenSanctions-only thresholds (we deliberately do NOT default to
+         SANCTIONED on fetch failure, otherwise a single network blip would
+         flag every bank).
 
     Returns dict with:
         status:    "sanctioned" | "clear" | "review"
@@ -682,35 +710,40 @@ def classify(
         )
 
     elif wl_available and not wl_in_list:
-        # Hybrid rule: bank is NOT on the OhMySwift whitelist AND OpenSanctions
-        # has not flagged it. Both signals are weak on their own — OhMySwift's
-        # 306-bank list is known to be incomplete (small regional banks like
-        # Bank Yekaterinburg get missed even though they aren't sanctioned),
-        # and OpenSanctions may have gaps for less-covered jurisdictions.
-        # We therefore raise REVIEW REQUIRED rather than declaring SANCTIONED.
+        # HYBRID RULE: bank is NOT on the OhMySwift whitelist AND OpenSanctions
+        # has not flagged it either. Both signals are weak on their own — the
+        # OhMySwift list is curated and known to be incomplete (small regional
+        # banks like Bank Yekaterinburg are missing even though they aren't
+        # sanctioned), and OpenSanctions may have gaps for less-covered
+        # jurisdictions. We therefore raise REVIEW REQUIRED rather than
+        # declaring SANCTIONED, and explain the conflict so the user can
+        # verify against the authoritative source.
         status = "review"
         checked = wl.get("checked_swifts") or []
+        list_count = wl.get("list_meta", {}).get("count", "?")
+        list_updated = wl.get("list_meta", {}).get("updated", "recently")
         if checked:
             reasons.append(
                 f"Bank's SWIFT BIC(s) {', '.join(f'`{s}`' for s in checked)} "
                 f"are NOT on the OhMySwift 'not under US SDN / EU sanctions' "
-                f"list ({wl.get('list_meta', {}).get('count', '?')} entries, "
-                f"updated {wl.get('list_meta', {}).get('updated', 'recently')}), "
-                f"but OpenSanctions also shows no active sanctions designation. "
-                f"**Manual review recommended** — most often this happens because "
-                f"the bank is a small regional player that OhMySwift's curated "
-                f"list simply hasn't catalogued, not because it is actually "
-                f"sanctioned."
+                f"list ({list_count} entries, updated {list_updated}), but "
+                f"OpenSanctions also shows no active sanctions designation. "
+                f"**Manual review recommended** — most often this happens "
+                f"because the bank is a small regional player that OhMySwift's "
+                f"curated list simply hasn't catalogued, not because it is "
+                f"actually sanctioned. Cross-check against the official OFAC "
+                f"SDN and EU consolidated lists before transacting."
             )
         else:
             reasons.append(
-                "This bank has no SWIFT/BIC we could check against the OhMySwift "
-                "whitelist, and OpenSanctions shows no active sanctions "
-                "designation. **Manual review recommended** — common for small "
-                "regional banks that lack SWIFT membership (ruble-only operations) "
-                "and aren't covered by either list. Verify directly with the bank "
-                "or against the official OFAC SDN / EU consolidated lists before "
-                "transacting."
+                f"This bank has no SWIFT/BIC we could check against the "
+                f"OhMySwift whitelist ({list_count} entries, updated "
+                f"{list_updated}), and OpenSanctions shows no active sanctions "
+                f"designation. **Manual review recommended** — common for "
+                f"small regional banks that lack SWIFT membership (ruble-only "
+                f"operations) and aren't covered by either list. Verify "
+                f"directly with the bank or against the official OFAC SDN / "
+                f"EU consolidated lists before transacting."
             )
 
     else:
@@ -1232,9 +1265,11 @@ with st.sidebar:
         "(Central Bank of Russia registry, refreshed daily).\n"
         "* Branch BIKs resolved via bankirsha.com → head-office BIK.\n"
         "* Sanctions match via `/match` endpoint with `logic-v2` scoring.\n"
-        "* OhMySwift whitelist is applied as a strict rule: bank not on "
-        "list ⇒ treated as sanctioned, unless OpenSanctions confirms clear "
-        "across all jurisdictions."
+        "* OhMySwift allowlist is applied as a **strict rule**: bank not on "
+        "list ⇒ treated as **sanctioned** (with a possible-false-positive "
+        "caveat for small banks). An OpenSanctions-confirmed sanction always "
+        "wins over the allowlist — covers more jurisdictions (UK, CA, JP, CH, "
+        "AU, UA) than OhMySwift's US-SDN + EU scope."
     )
 
 # --- Main pane ------------------------------------------------------------
