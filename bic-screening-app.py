@@ -1810,6 +1810,55 @@ else:
         )
 
     hits_by_id = screening["hits_by_entity_id"]
+
+    # ── Per-entity whitelist filter (OS-side SWIFT check) ────────────────
+    # The input-side whitelist check above only saw SWIFTs we resolved via
+    # CBR, iban.ru and Dadata. OpenSanctions stores its own ``swiftBic``
+    # property on every entity, which can carry SWIFTs we didn't surface —
+    # the head-office canonical form, alternate branch codes, historical
+    # SWIFTs the bank used before a rebrand. If a strict identifier hit
+    # comes back from an entity whose OS-stored SWIFT is itself on the
+    # OhMySwift whitelist, that entity IS the same clean bank reached via
+    # a different identifier path (commonly the INN or head-office BIK
+    # injection), and the match shouldn't drive a MATCH/REVIEW verdict.
+    # Move such entities to a separate bucket and recompute the verdict
+    # from the surviving hits.
+    whitelist_swifts_set = set(load_whitelist_swifts().keys())
+    os_whitelisted_entities: dict[str, dict[str, Any]] = {}
+    for eid in list(hits_by_id.keys()):
+        entity = hits_by_id[eid]["entity"]
+        entity_swifts = (entity.get("properties") or {}).get("swiftBic") or []
+        # Normalize each OS-stored SWIFT to 8-char canonical form and check
+        # against the OhMySwift whitelist (which is 8-char-keyed)
+        entity_swifts_8 = {
+            s.strip().upper()[:8]
+            for s in entity_swifts
+            if isinstance(s, str) and len(s.strip()) >= 8
+        }
+        matched_wl = entity_swifts_8 & whitelist_swifts_set
+        if matched_wl:
+            os_whitelisted_entities[eid] = {
+                **hits_by_id[eid],
+                "matched_whitelist_swifts": sorted(matched_wl),
+            }
+            del hits_by_id[eid]
+
+    if os_whitelisted_entities:
+        # Surface what was filtered, so the analyst sees that some OpenSanctions
+        # entities matched on identifier but were re-cleared via SWIFT-whitelist.
+        n_wl = len(os_whitelisted_entities)
+        names_str = ", ".join(
+            f"_{h['entity'].get('caption', '(no caption)')}_"
+            for h in list(os_whitelisted_entities.values())[:3]
+        )
+        if n_wl > 3:
+            names_str += f" (+{n_wl - 3} more)"
+        st.info(
+            f"✅ **{n_wl} OpenSanctions entity(ies) matched on identifier but "
+            "their OS-stored SWIFT is on the OhMySwift whitelist** — treating "
+            f"as whitelisted, not counting toward MATCH/REVIEW verdict: {names_str}"
+        )
+
     if hits_by_id:
         # ─── MATCH or REVIEW (depending on OFAC presence) ───────────────
         # Per the spec: any hit means the bank's identifier is on a watchlist.
@@ -1974,19 +2023,43 @@ else:
                     if props.get("swiftBic"):
                         st.write("**SWIFT(s) on file:**", ", ".join(f"`{s}`" for s in props["swiftBic"]))
     else:
-        # ─── CLEAR ──────────────────────────────────────────────────────
-        st.success(
-            "## 🟢 CLEAR\n\n"
-            "**No OpenSanctions entity matches this bank on a strict identifier** "
-            "(BIK, SWIFT, or INN). The bank is not currently indexed in OpenSanctions "
-            "under any of its resolved identifiers.\n\n"
-            "_Caveat: this verdict is based on exact identifier matching. A bank "
-            "could in theory be sanctioned under a name/address only if OpenSanctions "
-            "hasn't yet attached structured identifiers to the entity — uncommon but "
-            "possible for newly-listed entities before metadata enrichment. For "
-            "elevated-risk transactions, also check the bank's name directly against "
-            "current sanctions list updates._"
-        )
+        # No surviving hits. Distinguish two sub-cases:
+        # (a) There were no strict identifier hits at all → 🟢 CLEAR
+        # (b) There were hits but all got OS-whitelisted via swiftBic → ✅
+        if os_whitelisted_entities:
+            # ─── ✅ WHITELISTED (via OS-SWIFT post-filter) ──────────────
+            wl_lines = "\n".join(
+                f"- _{h['entity'].get('caption', '(no caption)')}_ "
+                f"(OS-stored SWIFT: "
+                f"{', '.join(f'`{s}`' for s in h['matched_whitelist_swifts'])})"
+                for h in os_whitelisted_entities.values()
+            )
+            st.success(
+                "## ✅ WHITELISTED\n\n"
+                f"OpenSanctions returned **{len(os_whitelisted_entities)} entity(ies)** "
+                "matching this bank on strict identifier, **but every one of them "
+                "has an OS-stored SWIFT that's on the OhMySwift whitelist** — i.e. "
+                "the matched legal entities are themselves on the curated list of "
+                "Russian banks not under US (SDN) and EU sanctions.\n\n"
+                f"{wl_lines}\n\n"
+                "_The strict-search hits here are most likely OpenSanctions' own "
+                "Russian bank reference records (`ru_cbr_banks` dataset), not "
+                "sanctions designations._"
+            )
+        else:
+            # ─── 🟢 CLEAR ───────────────────────────────────────────────
+            st.success(
+                "## 🟢 CLEAR\n\n"
+                "**No OpenSanctions entity matches this bank on a strict identifier** "
+                "(BIK, SWIFT, or INN). The bank is not currently indexed in OpenSanctions "
+                "under any of its resolved identifiers.\n\n"
+                "_Caveat: this verdict is based on exact identifier matching. A bank "
+                "could in theory be sanctioned under a name/address only if OpenSanctions "
+                "hasn't yet attached structured identifiers to the entity — uncommon but "
+                "possible for newly-listed entities before metadata enrichment. For "
+                "elevated-risk transactions, also check the bank's name directly against "
+                "current sanctions list updates._"
+            )
 
 # ── Raw payload (debug) ──────────────────────────────────────────────────
 with st.expander("🔍 Raw payload (debug)"):
@@ -2003,7 +2076,16 @@ with st.expander("🔍 Raw payload (debug)"):
     }
     if whitelist_hits:
         debug_payload["whitelist_hits"] = whitelist_hits
-        debug_payload["opensanctions_strict_screening"] = "skipped (whitelisted)"
+        debug_payload["opensanctions_strict_screening"] = "skipped (whitelisted via input SWIFT)"
     else:
         debug_payload["opensanctions_strict_screening"] = screening
+        if os_whitelisted_entities:
+            debug_payload["os_whitelisted_entities"] = {
+                eid: {
+                    "caption": h["entity"].get("caption"),
+                    "matched_whitelist_swifts": h["matched_whitelist_swifts"],
+                    "datasets": h["entity"].get("datasets"),
+                }
+                for eid, h in os_whitelisted_entities.items()
+            }
     st.json(debug_payload)
