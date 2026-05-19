@@ -707,6 +707,13 @@ def opensanctions_search_by_inn(api_key: str, inn: str) -> dict[str, Any]:
     entity in Russian tax registry, so any hit here is near-certain to be
     the same legal entity.
 
+    URL construction note: the query string is built manually rather than
+    using ``requests``'s ``params=`` kwarg because ``params`` percent-encodes
+    the colon in ``filter:innCode`` to ``filter%3AinnCode``, which the
+    OpenSanctions parser treats as an unknown parameter and silently ignores
+    (returning unfiltered results). The docs use unencoded ``filter:``
+    everywhere, so we preserve that form on the wire.
+
     Returns:
         ``{"results": [...], "total": N, "error": None}`` on success, with
         each result shaped like ``/match`` results (id, caption, properties,
@@ -715,14 +722,20 @@ def opensanctions_search_by_inn(api_key: str, inn: str) -> dict[str, Any]:
     """
     if not api_key or not inn:
         return {"results": [], "total": 0, "error": None}
+    # Build the URL manually so the colon in `filter:innCode` is NOT
+    # percent-encoded. INN is digits-only so no escaping needed for the value.
+    inn_clean = "".join(c for c in inn if c.isdigit())
+    if not inn_clean:
+        return {"results": [], "total": 0, "error": "invalid INN (no digits)"}
+    url = (
+        f"{OPENSANCTIONS_SEARCH_URL}"
+        f"?filter:innCode={inn_clean}"
+        f"&schema=LegalEntity"
+        f"&limit=20"
+    )
     try:
         r = requests.get(
-            OPENSANCTIONS_SEARCH_URL,
-            params={
-                "filter:innCode": inn,
-                "schema": "LegalEntity",  # hierarchical: includes Company, Organization
-                "limit": 20,
-            },
+            url,
             headers={"Authorization": f"ApiKey {api_key}"},
             timeout=20,
         )
@@ -734,13 +747,15 @@ def opensanctions_search_by_inn(api_key: str, inn: str) -> dict[str, Any]:
             "total": 0,
             "error": f"HTTP {e.response.status_code}",
             "detail": e.response.text[:500] if e.response is not None else "",
+            "url": url,
         }
     except Exception as e:
-        return {"results": [], "total": 0, "error": f"request failed: {e}"}
+        return {"results": [], "total": 0, "error": f"request failed: {e}", "url": url}
     return {
         "results": payload.get("results", []),
         "total": (payload.get("total") or {}).get("value", 0),
         "error": None,
+        "url": url,
     }
 
 
@@ -1646,6 +1661,9 @@ with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as
                     st.code(inn_search["detail"])
         else:
             inn_search_hits = inn_search.get("results", [])
+            # Show the wire URL for verifiability — confirms the colon survives unencoded
+            with st.expander("INN search URL sent (debug)"):
+                st.code(inn_search.get("url") or "(no URL)", language="text")
             if inn_search_hits:
                 # De-dupe against /match results by entity ID. Any hit that
                 # /match also found just gets enriched (we don't want to count
