@@ -661,6 +661,7 @@ def check_whitelist_matches(swifts: list[str] | set[str]) -> list[tuple[str, str
 
 
 OPENSANCTIONS_ENTITY_URL = "https://api.opensanctions.org/entities/"
+OPENSANCTIONS_SEARCH_URL = "https://api.opensanctions.org/search/default"
 
 
 def opensanctions_get_entity(api_key: str, entity_id: str) -> dict[str, Any] | None:
@@ -685,6 +686,62 @@ def opensanctions_get_entity(api_key: str, entity_id: str) -> dict[str, Any] | N
         return r.json()
     except Exception:
         return None
+
+
+def opensanctions_search_by_inn(api_key: str, inn: str) -> dict[str, Any]:
+    """Search OpenSanctions by INN against the ``innCode`` property.
+
+    Uses the ``/search/default`` endpoint with property-based filtering:
+    ``filter:innCode=<INN>&schema=LegalEntity``. The ``schema=LegalEntity``
+    parameter is hierarchical — it covers all subschemas including ``Company``
+    and ``Organization`` (which is what the user asked for: Company:innCode,
+    Organization:innCode, LegalEntity:innCode are all the same property at
+    different points in the schema tree, so a single LegalEntity-scoped query
+    catches them all).
+
+    Why complement ``/match``: ``/match`` does fuzzy textual scoring across
+    many properties and applies a score cutoff. An entity whose INN matches
+    ours exactly but whose name differs (e.g. registered under a holding's
+    name) might not cross the cutoff. ``/search`` with a property filter does
+    exact equality lookup on the indexed property — INN is unique per legal
+    entity in Russian tax registry, so any hit here is near-certain to be
+    the same legal entity.
+
+    Returns:
+        ``{"results": [...], "total": N, "error": None}`` on success, with
+        each result shaped like ``/match`` results (id, caption, properties,
+        datasets, topics) but **without a ``score`` field** — the caller
+        synthesises a high score for these exact-INN hits.
+    """
+    if not api_key or not inn:
+        return {"results": [], "total": 0, "error": None}
+    try:
+        r = requests.get(
+            OPENSANCTIONS_SEARCH_URL,
+            params={
+                "filter:innCode": inn,
+                "schema": "LegalEntity",  # hierarchical: includes Company, Organization
+                "limit": 20,
+            },
+            headers={"Authorization": f"ApiKey {api_key}"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        payload = r.json()
+    except requests.HTTPError as e:
+        return {
+            "results": [],
+            "total": 0,
+            "error": f"HTTP {e.response.status_code}",
+            "detail": e.response.text[:500] if e.response is not None else "",
+        }
+    except Exception as e:
+        return {"results": [], "total": 0, "error": f"request failed: {e}"}
+    return {
+        "results": payload.get("results", []),
+        "total": (payload.get("total") or {}).get("value", 0),
+        "error": None,
+    }
 
 
 def opensanctions_match(
@@ -1567,6 +1624,81 @@ with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as
     results = os_result.get("results", [])
     with st.expander("Query sent to OpenSanctions"):
         st.json(os_result.get("sent_properties", {}))
+
+    # ── INN-based property search (complementary to /match) ───────────────
+    # /match does fuzzy textual scoring with a score cutoff — an entity whose
+    # INN matches ours exactly but whose name differs (e.g. registered under
+    # a holding's name, or with old/cyrillic spelling) may not cross the
+    # cutoff. /search?filter:innCode=<INN> does exact equality on the indexed
+    # innCode property, scoped to LegalEntity (covers Company + Organization
+    # subschemas). Any hit here is near-certain to be the same legal entity
+    # since INN is unique in the Russian tax registry.
+    inn_search_hits: list[dict] = []
+    if inn_final:
+        inn_search = opensanctions_search_by_inn(OPENSANCTIONS_API_KEY, inn_final)
+        if inn_search.get("error"):
+            st.warning(
+                f"⚠️ INN property search failed: {inn_search['error']}. "
+                "Continuing with /match results only."
+            )
+            if inn_search.get("detail"):
+                with st.expander("INN search error detail (debug)"):
+                    st.code(inn_search["detail"])
+        else:
+            inn_search_hits = inn_search.get("results", [])
+            if inn_search_hits:
+                # De-dupe against /match results by entity ID. Any hit that
+                # /match also found just gets enriched (we don't want to count
+                # it twice); hits that ONLY came from INN-search get synthesised
+                # into the results list with a high exact-match score so the
+                # Step 4 verdict logic treats them as strong signals.
+                match_ids = {r.get("id") for r in results}
+                new_from_inn = [
+                    h for h in inn_search_hits if h.get("id") not in match_ids
+                ]
+                both_sources = [
+                    h for h in inn_search_hits if h.get("id") in match_ids
+                ]
+                # Mark and inject the INN-only hits
+                for hit in new_from_inn:
+                    hit["score"] = 0.95  # synthesised — exact INN match is near-certain
+                    hit["_inn_search_only"] = True
+                    results.append(hit)
+                # Mark the dual-source ones in place so the UI can show 🎯 too
+                for r in results:
+                    if r.get("id") in {h.get("id") for h in both_sources}:
+                        r["_inn_search_corroborated"] = True
+
+                # UI summary of what INN search contributed
+                summary_lines = [
+                    f"🎯 **INN property search:** `filter:innCode={inn_final}` "
+                    f"→ **{len(inn_search_hits)}** entity(ies) found "
+                    f"(`schema=LegalEntity`, includes Company/Organization)"
+                ]
+                if new_from_inn:
+                    captions_new = ", ".join(
+                        f"_{h.get('caption', '(no caption)')}_" for h in new_from_inn[:5]
+                    )
+                    summary_lines.append(
+                        f"- ⚠️ **{len(new_from_inn)} new** entity(ies) NOT in /match results: "
+                        f"{captions_new}{' …' if len(new_from_inn) > 5 else ''}"
+                    )
+                if both_sources:
+                    summary_lines.append(
+                        f"- ✓ {len(both_sources)} also returned by /match (corroborated)"
+                    )
+                st.markdown("\n".join(summary_lines))
+            else:
+                st.caption(
+                    f"_(INN property search: no entity with `innCode={inn_final}` in "
+                    "OpenSanctions — INN is either not on any sanctions/PEP/risk list, "
+                    "or not yet indexed by OS for this entity)_"
+                )
+    else:
+        st.caption(
+            "_(INN property search skipped: no INN resolved for this BIC in Step 1 or 2)_"
+        )
+
     status.update(label=f"Step 3 · {len(results)} candidate(s) returned", state="complete")
 
 # ─── STEP 4 ──────────────────────────────────────────────────────────────────
@@ -1683,6 +1815,12 @@ else:
     st.markdown("### Candidates")
     for r, score, overlap, label, emoji, reason in candidate_verdicts:
         title_extra = f" · 🔗 overlap: {', '.join(overlap)}" if overlap else ""
+        # INN-search provenance markers (set in Step 3 when /search?filter:innCode=...
+        # returned this entity). 🎯 = exact INN match.
+        if r.get("_inn_search_only"):
+            title_extra += " · 🎯 INN-only"
+        elif r.get("_inn_search_corroborated"):
+            title_extra += " · 🎯 INN+/match"
         with st.expander(
             f"{emoji}  {r.get('caption', '(no caption)')}  ·  score {score:.3f}{title_extra}"
         ):
@@ -1693,6 +1831,18 @@ else:
                 st.write("**ID:**", r.get("id"))
                 st.write("**Schema:**", r.get("schema"))
                 st.write("**Score:**", f"{score:.4f}")
+                if r.get("_inn_search_only"):
+                    st.info(
+                        "🎯 Found via INN property search only — "
+                        "`/match` did not surface this entity above its cutoff. "
+                        "Score 0.95 is synthesised (exact INN match in OpenSanctions)."
+                    )
+                elif r.get("_inn_search_corroborated"):
+                    st.success(
+                        "🎯 Corroborated by INN property search "
+                        "(found by both `/match` and `filter:innCode`). "
+                        "Strong identifier-level confirmation."
+                    )
                 st.write("**Match?**", r.get("match"))
                 if overlap:
                     st.write("**Name overlap:**", ", ".join(f"`{t}`" for t in overlap))
