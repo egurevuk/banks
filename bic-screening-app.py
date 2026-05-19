@@ -688,48 +688,45 @@ def opensanctions_get_entity(api_key: str, entity_id: str) -> dict[str, Any] | N
         return None
 
 
-def opensanctions_search_by_inn(api_key: str, inn: str) -> dict[str, Any]:
-    """Search OpenSanctions by INN against the ``innCode`` property.
+def opensanctions_search_by_property(
+    api_key: str,
+    prop_name: str,
+    value: str,
+) -> dict[str, Any]:
+    """Strict-equality search OpenSanctions by an indexed property value.
 
-    Uses the ``/search/default`` endpoint with property-based filtering:
-    ``filter:innCode=<INN>&schema=LegalEntity``. The ``schema=LegalEntity``
-    parameter is hierarchical — it covers all subschemas including ``Company``
-    and ``Organization`` (which is what the user asked for: Company:innCode,
-    Organization:innCode, LegalEntity:innCode are all the same property at
-    different points in the schema tree, so a single LegalEntity-scoped query
-    catches them all).
+    Uses the ``/search/default`` endpoint with a field-targeted query in the
+    form ``q=properties.<prop_name>:<value>``. This is OpenSanctions'
+    Elasticsearch-backed field query (see https://www.opensanctions.org/docs/api/search/);
+    it performs exact-equality matching on the indexed property value.
 
-    Why complement ``/match``: ``/match`` does fuzzy textual scoring across
-    many properties and applies a score cutoff. An entity whose INN matches
-    ours exactly but whose name differs (e.g. registered under a holding's
-    name) might not cross the cutoff. ``/search`` with a property filter does
-    exact equality lookup on the indexed property — INN is unique per legal
-    entity in Russian tax registry, so any hit here is near-certain to be
-    the same legal entity.
+    The ``filter:<prop>`` syntax that exists on the ``/match`` endpoint does
+    NOT exist on ``/search`` — passing it there is silently ignored and the
+    search degrades to returning the highest-ranked sanctioned entities in
+    the database (which produces egregious false positives like Revival of
+    Islamic Heritage Society dominating any unfiltered Russian-bank screening).
+    Use this helper everywhere — never construct ``filter:`` URLs for ``/search``.
 
-    URL construction note: the query string is built manually rather than
-    using ``requests``'s ``params=`` kwarg because ``params`` percent-encodes
-    the colon in ``filter:innCode`` to ``filter%3AinnCode``, which the
-    OpenSanctions parser treats as an unknown parameter and silently ignores
-    (returning unfiltered results). The docs use unencoded ``filter:``
-    everywhere, so we preserve that form on the wire.
+    ``schema=LegalEntity`` is hierarchical — covers Company, Organization,
+    PublicBody, Asset, and any other LegalEntity subschema.
 
-    Returns:
-        ``{"results": [...], "total": N, "error": None}`` on success, with
-        each result shaped like ``/match`` results (id, caption, properties,
-        datasets, topics) but **without a ``score`` field** — the caller
-        synthesises a high score for these exact-INN hits.
+    Used in Step 4's strict-identifier verdict logic for:
+      - ``bikCode``: 9-digit Russian Bank Identification Code
+      - ``swiftBic``: 8- or 11-char SWIFT BIC
+      - ``innCode``: 10- or 12-digit Russian tax ID
+
+    Returns ``{"results": [...], "total": N, "error": None, "url": "..."}``.
     """
-    if not api_key or not inn:
+    if not api_key or not value:
         return {"results": [], "total": 0, "error": None}
-    # Build the URL manually so the colon in `filter:innCode` is NOT
-    # percent-encoded. INN is digits-only so no escaping needed for the value.
-    inn_clean = "".join(c for c in inn if c.isdigit())
-    if not inn_clean:
-        return {"results": [], "total": 0, "error": "invalid INN (no digits)"}
+    value_clean = str(value).strip().upper()
+    if not value_clean:
+        return {"results": [], "total": 0, "error": "empty_value"}
+    # Build the URL manually so the colon in `properties.X:` is NOT
+    # percent-encoded by requests. Values are alphanumeric so no escaping needed.
     url = (
         f"{OPENSANCTIONS_SEARCH_URL}"
-        f"?filter:innCode={inn_clean}"
+        f"?q=properties.{prop_name}:{value_clean}"
         f"&schema=LegalEntity"
         f"&limit=20"
     )
@@ -757,6 +754,93 @@ def opensanctions_search_by_inn(api_key: str, inn: str) -> dict[str, Any]:
         "error": None,
         "url": url,
     }
+
+
+def opensanctions_strict_screening(
+    api_key: str,
+    *,
+    bics: list[str] | set[str],
+    swifts: list[str] | set[str],
+    inn: str | None,
+) -> dict[str, Any]:
+    """Run the full strict-identifier screening for a bank.
+
+    Three queries — one per identifier type — to find any OpenSanctions entity
+    whose indexed property equals one of our resolved identifiers. Each hit is
+    near-certain to be the same legal entity since these identifiers are
+    globally unique (BIK assigned by CBR, INN by FNS, SWIFT BIC by SCRL).
+
+    Validation:
+      - BIKs must be exactly 9 digits (Russian routing code shape)
+      - SWIFTs must be 8 or 11 chars and start with 4 letters + 2 letters
+        (institution + country); we normalize to 8-char form for the query
+        since OpenSanctions canonically stores 8-char form
+      - INN must be exactly 10 or 12 digits (legal entity or individual);
+        anything else is rejected as it cannot be a real INN
+
+    Returns:
+        ``{
+            "hits_by_entity_id": {entity_id: {"entity": dict, "matches": [(prop, value), ...]}},
+            "searches": [{"prop": str, "value": str, "url": str, "total": int, "error": str|None}],
+        }``
+    """
+    hits_by_entity_id: dict[str, dict[str, Any]] = {}
+    searches: list[dict[str, Any]] = []
+
+    def _record(prop: str, value: str, result: dict) -> None:
+        searches.append({
+            "prop": prop,
+            "value": value,
+            "url": result.get("url"),
+            "total": result.get("total", 0),
+            "error": result.get("error"),
+            "n_hits": len(result.get("results", [])),
+        })
+        for entity in result.get("results", []):
+            eid = entity.get("id")
+            if not eid:
+                continue
+            if eid not in hits_by_entity_id:
+                hits_by_entity_id[eid] = {"entity": entity, "matches": []}
+            hits_by_entity_id[eid]["matches"].append((prop, value))
+
+    # 1. BIK strict search — one query per unique 9-digit BIK
+    seen_biks: set[str] = set()
+    for bik in bics or []:
+        clean = "".join(c for c in str(bik) if c.isdigit())
+        if len(clean) != 9 or clean in seen_biks:
+            continue
+        seen_biks.add(clean)
+        _record("bikCode", clean, opensanctions_search_by_property(api_key, "bikCode", clean))
+
+    # 2. SWIFT strict search — normalize to 8-char canonical form, dedupe
+    seen_swifts: set[str] = set()
+    for s in swifts or []:
+        s8 = str(s).strip().upper()[:8]
+        if len(s8) != 8 or s8 in seen_swifts:
+            continue
+        # Validate SWIFT BIC shape: 4 letters + 2 letters + 2 alphanumeric
+        if not re.match(r"^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}$", s8):
+            continue
+        seen_swifts.add(s8)
+        _record("swiftBic", s8, opensanctions_search_by_property(api_key, "swiftBic", s8))
+
+    # 3. INN strict search — validate 10 or 12 digits
+    if inn:
+        clean_inn = "".join(c for c in str(inn) if c.isdigit())
+        if len(clean_inn) in (10, 12):
+            _record("innCode", clean_inn, opensanctions_search_by_property(api_key, "innCode", clean_inn))
+        else:
+            searches.append({
+                "prop": "innCode",
+                "value": clean_inn or str(inn),
+                "url": None,
+                "total": 0,
+                "error": f"invalid_inn_shape (got {len(clean_inn)} digits, expected 10 or 12)",
+                "n_hits": 0,
+            })
+
+    return {"hits_by_entity_id": hits_by_entity_id, "searches": searches}
 
 
 def opensanctions_match(
@@ -1209,10 +1293,10 @@ with st.sidebar:
             "`.streamlit/secrets.toml` or env var `OPENSANCTIONS_API_KEY`."
         )
     st.markdown(
-        "**Score thresholds**  \n"
-        f"🔴 Match: ≥ {SCORE_HIT:.2f}  \n"
-        f"🟡 Review: ≥ {SCORE_REVIEW:.2f}  \n"
-        "🟢 Likely clear: below"
+        "**Verdict rules**  \n"
+        "✅ **Whitelisted** — SWIFT on OhMySwift list  \n"
+        "🔴 **Match** — strict hit on BIK, SWIFT, or INN  \n"
+        "🟢 **Clear** — no whitelist, no strict hit"
     )
 
 col1, col2 = st.columns([3, 1])
@@ -1618,116 +1702,30 @@ with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as
             swift_pool.add(s[:8].upper())
     all_swifts = sorted(swift_pool)
 
-    os_result = opensanctions_match(
-        OPENSANCTIONS_API_KEY,
-        names=names,
-        addresses=addresses,
-        swift_codes=all_swifts,
-        bik_codes=all_bics,
-        inn=inn_final,
-        ogrn=ogrn_final,
-        reg_number=reg_final,
-        kpp_codes=all_kpps,
+    # ── Step 3: deferred. The strict-identifier screening that drives the
+    # verdict happens in Step 4 below, since it consumes the same identifier
+    # pools (`all_bics`, `all_swifts`, `inn_final`) and can be short-circuited
+    # by the OhMySwift whitelist — running it here would mean making API calls
+    # for whitelisted banks unnecessarily.
+    status.update(
+        label=f"Step 3 · resolved {len(all_bics)} BIC(s), {len(all_swifts)} SWIFT(s)"
+        + (f", INN {inn_final}" if inn_final else ", no INN"),
+        state="complete",
     )
-    if os_result.get("error"):
-        st.error(os_result["error"])
-        if os_result.get("detail"):
-            st.code(os_result["detail"])
-        status.update(label=f"Step 3 · {os_result['error']}", state="error")
-        st.stop()
-
-    results = os_result.get("results", [])
-    with st.expander("Query sent to OpenSanctions"):
-        st.json(os_result.get("sent_properties", {}))
-
-    # ── INN-based property search (complementary to /match) ───────────────
-    # /match does fuzzy textual scoring with a score cutoff — an entity whose
-    # INN matches ours exactly but whose name differs (e.g. registered under
-    # a holding's name, or with old/cyrillic spelling) may not cross the
-    # cutoff. /search?filter:innCode=<INN> does exact equality on the indexed
-    # innCode property, scoped to LegalEntity (covers Company + Organization
-    # subschemas). Any hit here is near-certain to be the same legal entity
-    # since INN is unique in the Russian tax registry.
-    inn_search_hits: list[dict] = []
-    if inn_final:
-        inn_search = opensanctions_search_by_inn(OPENSANCTIONS_API_KEY, inn_final)
-        if inn_search.get("error"):
-            st.warning(
-                f"⚠️ INN property search failed: {inn_search['error']}. "
-                "Continuing with /match results only."
-            )
-            if inn_search.get("detail"):
-                with st.expander("INN search error detail (debug)"):
-                    st.code(inn_search["detail"])
-        else:
-            inn_search_hits = inn_search.get("results", [])
-            # Show the wire URL for verifiability — confirms the colon survives unencoded
-            with st.expander("INN search URL sent (debug)"):
-                st.code(inn_search.get("url") or "(no URL)", language="text")
-            if inn_search_hits:
-                # De-dupe against /match results by entity ID. Any hit that
-                # /match also found just gets enriched (we don't want to count
-                # it twice); hits that ONLY came from INN-search get synthesised
-                # into the results list with a high exact-match score so the
-                # Step 4 verdict logic treats them as strong signals.
-                match_ids = {r.get("id") for r in results}
-                new_from_inn = [
-                    h for h in inn_search_hits if h.get("id") not in match_ids
-                ]
-                both_sources = [
-                    h for h in inn_search_hits if h.get("id") in match_ids
-                ]
-                # Mark and inject the INN-only hits
-                for hit in new_from_inn:
-                    hit["score"] = 0.95  # synthesised — exact INN match is near-certain
-                    hit["_inn_search_only"] = True
-                    results.append(hit)
-                # Mark the dual-source ones in place so the UI can show 🎯 too
-                for r in results:
-                    if r.get("id") in {h.get("id") for h in both_sources}:
-                        r["_inn_search_corroborated"] = True
-
-                # UI summary of what INN search contributed
-                summary_lines = [
-                    f"🎯 **INN property search:** `filter:innCode={inn_final}` "
-                    f"→ **{len(inn_search_hits)}** entity(ies) found "
-                    f"(`schema=LegalEntity`, includes Company/Organization)"
-                ]
-                if new_from_inn:
-                    captions_new = ", ".join(
-                        f"_{h.get('caption', '(no caption)')}_" for h in new_from_inn[:5]
-                    )
-                    summary_lines.append(
-                        f"- ⚠️ **{len(new_from_inn)} new** entity(ies) NOT in /match results: "
-                        f"{captions_new}{' …' if len(new_from_inn) > 5 else ''}"
-                    )
-                if both_sources:
-                    summary_lines.append(
-                        f"- ✓ {len(both_sources)} also returned by /match (corroborated)"
-                    )
-                st.markdown("\n".join(summary_lines))
-            else:
-                st.caption(
-                    f"_(INN property search: no entity with `innCode={inn_final}` in "
-                    "OpenSanctions — INN is either not on any sanctions/PEP/risk list, "
-                    "or not yet indexed by OS for this entity)_"
-                )
-    else:
-        st.caption(
-            "_(INN property search skipped: no INN resolved for this BIC in Step 1 or 2)_"
-        )
-
-    status.update(label=f"Step 3 · {len(results)} candidate(s) returned", state="complete")
 
 # ─── STEP 4 ──────────────────────────────────────────────────────────────────
 st.markdown("## Step 4 · Verdict")
+st.caption(
+    "Verdict logic: **(1)** if any SWIFT matches the OhMySwift whitelist of "
+    "Russian banks NOT under US/EU sanctions → ✅ WHITELISTED. **(2)** otherwise, "
+    "run a strict OpenSanctions search on BIK, SWIFT, and INN — any hit → 🔴 MATCH; "
+    "no hits → 🟢 CLEAR."
+)
 
-# ── Whitelist check ──────────────────────────────────────────────────────
+# ── (1) Whitelist check ──────────────────────────────────────────────────
 # Cross-reference the bank's resolved SWIFTs against the OhMySwift curated
-# list of Russian banks NOT under US (SDN) and EU sanctions. A match here is
-# a strong positive signal that the bank is clean — but only with respect to
-# those two jurisdictions, so we still run the full OpenSanctions screening
-# below (which covers UK, JP, CA, AU, CH, UA, etc.).
+# list of Russian banks NOT under US (SDN) and EU sanctions. If matched, we
+# short-circuit and skip the OpenSanctions calls entirely — that's the spec.
 whitelist_hits = check_whitelist_matches(swift_pool)
 if whitelist_hits:
     hits_str = "\n".join(
@@ -1735,234 +1733,208 @@ if whitelist_hits:
         for swift_8, name in whitelist_hits
     )
     st.success(
-        "✅ **WHITELISTED** — this bank's SWIFT appears on the curated list of "
-        "**Russian banks NOT under US (SDN) and EU sanctions**:\n\n"
+        "## ✅ WHITELISTED\n\n"
+        "This bank's SWIFT appears on the curated list of **Russian banks NOT under "
+        "US (SDN) and EU sanctions**:\n\n"
         f"{hits_str}\n\n"
-        "_Source: OhMySwift.xlsx (compiled from iban.ru's classification of "
-        "Russian banks against the US SDN list and EU consolidated sanctions). "
-        "This is an additional positive signal. **The OpenSanctions verdict "
-        "below covers more jurisdictions** — a `MATCH` there would still warrant "
-        "review even with a whitelist hit._"
+        "_Source: OhMySwift.xlsx (compiled from iban.ru's classification of Russian "
+        "banks against the US SDN list and EU consolidated sanctions)._\n\n"
+        "_Per the verdict spec, OpenSanctions strict-identifier search is skipped "
+        "when whitelisted. The whitelist covers US + EU only — if you need to "
+        "verify against UK, JP, CA, AU, CH, or UA sanctions specifically, run an "
+        "ad-hoc OpenSanctions lookup outside this tool._"
     )
 
-if not results:
-    st.success("🟢 **No matches in OpenSanctions** — no candidate entities returned for this bank.")
 else:
-    # Compute per-candidate verdicts using both score and name-token overlap
-    candidate_verdicts = []
-    for r in results:
-        score = r.get("score") or 0
-        props = r.get("properties", {})
-        overlap = name_token_overlap(names, props)
-        label, emoji, reason = compute_verdict(score, overlap)
-        candidate_verdicts.append((r, score, overlap, label, emoji, reason))
-
-    # Overall verdict = worst (most severe) of all candidates
-    severity = {"MATCH": 3, "REVIEW": 2, "LIKELY CLEAR": 1}
-    candidate_verdicts.sort(key=lambda t: (severity[t[3]], t[1]), reverse=True)
-    top_result, top_score, top_overlap, top_label, top_emoji, top_reason = candidate_verdicts[0]
-
-    if top_label == "MATCH":
-        st.error(f"{top_emoji} **{top_label}** — {top_reason}. Investigate before transacting.")
-    elif top_label == "REVIEW":
-        st.warning(f"{top_emoji} **{top_label}** — {top_reason}. Manual review required.")
-    else:
-        st.success(f"{top_emoji} **{top_label}** — {top_reason}. Likely false positive.")
-
-    # If the special-case keyword detection added head-office BICs in Step 3,
-    # surface that here too — the verdict section is the natural place for
-    # the analyst to see that screening coverage was extended beyond the
-    # entered BIC.
-    if extra_bics_added:
-        extras_summary = ", ".join(
-            f"`{b}` ({kw})" for kw, b in extra_bics_added
+    # ── (2) Strict identifier screening ──────────────────────────────────
+    # Three /search calls against OpenSanctions, one per identifier type.
+    # Each uses the field-targeted q=properties.X:Y syntax (NOT filter:X,
+    # which doesn't exist on the search endpoint — passing it returns
+    # unfiltered top-ranked entities, which is the false-positive trap that
+    # earlier surfaced unrelated entities like Revival of Islamic Heritage
+    # Society).
+    with st.status("Step 4 · OpenSanctions strict identifier screening", expanded=True) as v_status:
+        screening = opensanctions_strict_screening(
+            OPENSANCTIONS_API_KEY,
+            bics=all_bics,
+            swifts=all_swifts,
+            inn=inn_final,
         )
-        st.info(
-            f"📛 **Screening extended with {len(extra_bics_added)} additional "
-            f"head-office BIC(s):** {extras_summary}. "
-            "The candidates below may include the head-office legal entity "
-            "matched via these BICs, not just the originally-entered BIC."
-        )
-
-    # ── Top-level Sanctioning Jurisdictions ────────────────────────────────
-    # Surfaces the country breakdown from the BEST match (most severe by
-    # verdict, then highest score) directly under the verdict so the analyst
-    # doesn't need to expand candidate details to see which jurisdictions
-    # have sanctioned this entity. The same data is repeated inside the
-    # candidate expander below for completeness.
-    top_buckets = categorize_datasets(top_result.get("datasets") or [])
-    st.markdown(f"### 🌍 Sanctioning Jurisdictions")
-    st.caption(
-        f"From best match: **{top_result.get('caption', '(no caption)')}** "
-        f"(score {top_score:.3f})"
-    )
-    if top_buckets["sanctions"]:
-        st.markdown(
-            f"**{len(top_buckets['sanctions'])} jurisdiction(s)** with sanctions / "
-            f"export-control coverage of this entity:"
-        )
-        for (flag, country), lists in sorted(
-            top_buckets["sanctions"].items(), key=lambda kv: kv[0][1]
-        ):
-            deduped = list(dict.fromkeys(lists))
-            list_str = " · ".join(f"_{l}_" for l in deduped)
-            st.markdown(f"- {flag} **{country}** — {list_str}")
-    else:
-        st.info(
-            "No sanctioning jurisdictions found for this match. The entity "
-            "is either not on any government sanctions list, or appears only "
-            "in reference data (registries, FATCA, KYB)."
-        )
-    if top_buckets["counter_sanctions"]:
-        st.markdown("**Counter-sanctions (entity is target of):**")
-        for (flag, country), lists in sorted(
-            top_buckets["counter_sanctions"].items(), key=lambda kv: kv[0][1]
-        ):
-            deduped = list(dict.fromkeys(lists))
-            list_str = " · ".join(f"_{l}_" for l in deduped)
-            st.markdown(f"- {flag} **{country}** — {list_str}")
-    if top_buckets["other_risk"]:
-        st.markdown("**Other risk findings** _(debarment / regulatory / crime):_")
-        for (flag, country), lists in sorted(
-            top_buckets["other_risk"].items(), key=lambda kv: kv[0][1]
-        ):
-            deduped = list(dict.fromkeys(lists))
-            list_str = " · ".join(f"_{l}_" for l in deduped)
-            st.markdown(f"- {flag} **{country}** — {list_str}")
-
-    st.markdown("### Candidates")
-    for r, score, overlap, label, emoji, reason in candidate_verdicts:
-        title_extra = f" · 🔗 overlap: {', '.join(overlap)}" if overlap else ""
-        # INN-search provenance markers (set in Step 3 when /search?filter:innCode=...
-        # returned this entity). 🎯 = exact INN match.
-        if r.get("_inn_search_only"):
-            title_extra += " · 🎯 INN-only"
-        elif r.get("_inn_search_corroborated"):
-            title_extra += " · 🎯 INN+/match"
-        with st.expander(
-            f"{emoji}  {r.get('caption', '(no caption)')}  ·  score {score:.3f}{title_extra}"
-        ):
-            cols = st.columns([1, 2])
-            with cols[0]:
-                st.write("**Verdict:**", f"{emoji} {label}")
-                st.write("**Reason:**", reason)
-                st.write("**ID:**", r.get("id"))
-                st.write("**Schema:**", r.get("schema"))
-                st.write("**Score:**", f"{score:.4f}")
-                if r.get("_inn_search_only"):
-                    st.info(
-                        "🎯 Found via INN property search only — "
-                        "`/match` did not surface this entity above its cutoff. "
-                        "Score 0.95 is synthesised (exact INN match in OpenSanctions)."
-                    )
-                elif r.get("_inn_search_corroborated"):
-                    st.success(
-                        "🎯 Corroborated by INN property search "
-                        "(found by both `/match` and `filter:innCode`). "
-                        "Strong identifier-level confirmation."
-                    )
-                st.write("**Match?**", r.get("match"))
-                if overlap:
-                    st.write("**Name overlap:**", ", ".join(f"`{t}`" for t in overlap))
-                if r.get("datasets"):
-                    st.write("**Datasets:**")
-                    for d in r["datasets"]:
-                        st.write(f"- `{d}`")
-            with cols[1]:
-                props = r.get("properties", {})
-                relevant_keys = [
-                    "name", "alias", "address", "country", "jurisdiction",
-                    "registrationNumber", "swiftBic", "innCode", "ogrnCode",
-                    "topics", "program", "sanctions",
-                ]
-                shown = {k: props[k] for k in relevant_keys if k in props}
-                if shown:
-                    st.write("**Properties:**")
-                    st.json(shown)
-                rid = r.get("id")
-                if rid:
-                    st.markdown(f"[Open in OpenSanctions ↗](https://opensanctions.org/entities/{rid}/)")
-
-            # ── Sanctioning Jurisdictions ───────────────────────────────────
-            # New block: parse the entity's datasets and group by issuing country.
-            # OpenSanctions dataset codes are ISO-prefixed (us_*, eu_*, gb_*, ...)
-            # so we can map them to flag + country + list-name. Sanctions and
-            # export-control go in the headline list; counter-sanctions (Russia,
-            # China) are shown separately because their meaning is inverted;
-            # debarment/regulatory/crime as "other risk"; registries as reference.
-            buckets = categorize_datasets(r.get("datasets") or [])
-            st.markdown("---")
-            if buckets["sanctions"]:
-                n_jurisdictions = len(buckets["sanctions"])
+        # Audit table: what was searched, what came back
+        st.markdown("**Searches performed:**")
+        any_run = False
+        for s in screening["searches"]:
+            any_run = True
+            if s.get("error"):
                 st.markdown(
-                    f"#### 🌍 Sanctioning Jurisdictions ({n_jurisdictions})"
+                    f"- ⚠️ `{s['prop']}={s['value']}` → {s['error']}"
                 )
-                st.caption(
-                    "Countries / international bodies whose sanctions or "
-                    "export-control regimes cover this entity:"
+            elif s.get("n_hits", 0) == 0:
+                st.markdown(
+                    f"- 🟢 `{s['prop']}={s['value']}` → no hit"
                 )
-                # Sort by country name within each line
-                for (flag, country), lists in sorted(
-                    buckets["sanctions"].items(), key=lambda kv: kv[0][1]
-                ):
-                    deduped = list(dict.fromkeys(lists))
-                    list_str = " · ".join(f"_{l}_" for l in deduped)
-                    st.markdown(f"- {flag} **{country}** — {list_str}")
             else:
-                st.markdown("#### 🌍 Sanctioning Jurisdictions")
-                st.info(
-                    "No sanctioning jurisdictions found for this entity. "
-                    "Either OpenSanctions has not seen it on any government "
-                    "sanctions list, or it appears only in reference data "
-                    "(registries, FATCA, KYB). See below for details."
+                st.markdown(
+                    f"- 🔴 `{s['prop']}={s['value']}` → **{s['n_hits']} hit(s)**"
                 )
+        if not any_run:
+            st.warning(
+                "No identifiers available to screen. Steps 1 and 2 didn't resolve "
+                "any of BIK, SWIFT, or INN. Cannot reach a verdict."
+            )
+        # Show URLs for transparency / debugging
+        with st.expander("Strict-search URLs (debug)"):
+            for s in screening["searches"]:
+                if s.get("url"):
+                    st.code(s["url"], language="text")
+        v_status.update(
+            label=f"Step 4 · {len(screening['hits_by_entity_id'])} unique entity(ies) hit",
+            state="complete",
+        )
 
-            if buckets["counter_sanctions"]:
-                st.markdown("**Counter-sanctions (entity is target of):**")
-                for (flag, country), lists in sorted(
-                    buckets["counter_sanctions"].items(), key=lambda kv: kv[0][1]
-                ):
-                    deduped = list(dict.fromkeys(lists))
-                    list_str = " · ".join(f"_{l}_" for l in deduped)
-                    st.markdown(f"- {flag} **{country}** — {list_str}")
-                st.caption(
-                    "_Counter-sanctions are imposed BY a country (e.g. Russia, "
-                    "China) AGAINST foreign targets. Being listed here means the "
-                    "entity is sanctioned by Russia/China — typically not a "
-                    "compliance risk for Western counterparties, but worth "
-                    "knowing context._"
-                )
+    hits_by_id = screening["hits_by_entity_id"]
+    if hits_by_id:
+        # ─── MATCH ──────────────────────────────────────────────────────
+        st.error(
+            f"## 🔴 MATCH\n\n"
+            f"**{len(hits_by_id)} OpenSanctions entity(ies) match this bank on a strict "
+            f"identifier (BIK, SWIFT, or INN).** Strict-identifier hits are near-certain "
+            "matches since these identifiers are globally unique per legal entity. "
+            "**Investigate each before transacting.**"
+        )
 
-            if buckets["other_risk"]:
-                st.markdown("**Other risk findings** _(debarment / regulatory / crime):_")
-                for (flag, country), lists in sorted(
-                    buckets["other_risk"].items(), key=lambda kv: kv[0][1]
-                ):
-                    deduped = list(dict.fromkeys(lists))
-                    list_str = " · ".join(f"_{l}_" for l in deduped)
-                    st.markdown(f"- {flag} **{country}** — {list_str}")
+        # ── Top-level Sanctioning Jurisdictions (aggregated across all hits) ──
+        agg_buckets = {"sanctions": {}, "counter_sanctions": {}, "other_risk": {}, "reference": [], "unmapped": []}
+        for hit in hits_by_id.values():
+            buckets = categorize_datasets(hit["entity"].get("datasets") or [])
+            for k in ("sanctions", "counter_sanctions", "other_risk"):
+                for key, lists in buckets[k].items():
+                    agg_buckets[k].setdefault(key, []).extend(lists)
+            agg_buckets["reference"].extend(buckets["reference"])
+            agg_buckets["unmapped"].extend(buckets["unmapped"])
 
-            if buckets["reference"]:
-                with st.expander(
-                    f"Reference data sources ({len(buckets['reference'])}) — "
-                    f"not risk indicators"
-                ):
-                    for flag, country, label in buckets["reference"]:
-                        st.markdown(f"- {flag} {country} · {label}")
+        st.markdown("### 🌍 Sanctioning Jurisdictions")
+        if agg_buckets["sanctions"]:
+            st.markdown(
+                f"**{len(agg_buckets['sanctions'])} jurisdiction(s)** with sanctions / "
+                "export-control coverage of the matched entity(ies):"
+            )
+            for (flag, country), lists in sorted(
+                agg_buckets["sanctions"].items(), key=lambda kv: kv[0][1]
+            ):
+                deduped = list(dict.fromkeys(lists))
+                list_str = " · ".join(f"_{l}_" for l in deduped)
+                st.markdown(f"- {flag} **{country}** — {list_str}")
+        else:
+            st.info(
+                "No government sanctioning jurisdictions in the matched entity's "
+                "dataset list. The hit may be from PEP/RCA, regulatory warning, "
+                "or other risk lists rather than from a sanctions program."
+            )
+        if agg_buckets["counter_sanctions"]:
+            st.markdown("**Counter-sanctions (entity is target of):**")
+            for (flag, country), lists in sorted(
+                agg_buckets["counter_sanctions"].items(), key=lambda kv: kv[0][1]
+            ):
+                deduped = list(dict.fromkeys(lists))
+                list_str = " · ".join(f"_{l}_" for l in deduped)
+                st.markdown(f"- {flag} **{country}** — {list_str}")
+        if agg_buckets["other_risk"]:
+            st.markdown("**Other risk findings** _(debarment / regulatory / crime):_")
+            for (flag, country), lists in sorted(
+                agg_buckets["other_risk"].items(), key=lambda kv: kv[0][1]
+            ):
+                deduped = list(dict.fromkeys(lists))
+                list_str = " · ".join(f"_{l}_" for l in deduped)
+                st.markdown(f"- {flag} **{country}** — {list_str}")
 
-            if buckets["unmapped"]:
-                with st.expander(
-                    f"Unmapped datasets ({len(buckets['unmapped'])}) — "
-                    f"not in our country mapping"
-                ):
-                    for ds in buckets["unmapped"]:
-                        st.markdown(f"- `{ds}`")
+        # ── Matched entities (one expander per unique entity) ─────────────
+        st.markdown("### Matched entities")
+        # Identifier-type labels for prettier display
+        PROP_LABEL = {"bikCode": "BIK", "swiftBic": "SWIFT", "innCode": "INN"}
+        for eid, hit in hits_by_id.items():
+            entity = hit["entity"]
+            matches = hit["matches"]
+            match_summary = " · ".join(
+                f"{PROP_LABEL.get(prop, prop)} `{val}`" for prop, val in matches
+            )
+            with st.expander(
+                f"🔴 {entity.get('caption', '(no caption)')} · matched by {match_summary}"
+            ):
+                cols = st.columns([1, 2])
+                with cols[0]:
+                    st.write("**OpenSanctions ID:**", eid)
+                    st.write("**Schema:**", entity.get("schema"))
+                    st.write("**Matched on:**")
+                    for prop, val in matches:
+                        st.write(f"- `{PROP_LABEL.get(prop, prop)}` = `{val}`")
+                    if entity.get("datasets"):
+                        st.write("**Datasets:**")
+                        for d in entity["datasets"]:
+                            st.write(f"- `{d}`")
+                    st.markdown(
+                        f"[Open in OpenSanctions ↗]"
+                        f"(https://www.opensanctions.org/entities/{eid}/)"
+                    )
+                with cols[1]:
+                    # Per-entity sanctioning jurisdictions
+                    e_buckets = categorize_datasets(entity.get("datasets") or [])
+                    if e_buckets["sanctions"]:
+                        st.markdown("**🌍 Sanctioning jurisdictions for this entity:**")
+                        for (flag, country), lists in sorted(
+                            e_buckets["sanctions"].items(), key=lambda kv: kv[0][1]
+                        ):
+                            deduped = list(dict.fromkeys(lists))
+                            list_str = " · ".join(f"_{l}_" for l in deduped)
+                            st.markdown(f"- {flag} **{country}** — {list_str}")
+                    # Topics (PEP, sanction, crime, etc.)
+                    if entity.get("topics"):
+                        st.write("**Topics:**", ", ".join(f"`{t}`" for t in entity["topics"]))
+                    # Show key entity properties
+                    props = entity.get("properties", {}) or {}
+                    if props.get("name"):
+                        st.write("**Names:**", ", ".join(props["name"][:5]))
+                    if props.get("country"):
+                        st.write("**Country:**", ", ".join(props["country"]))
+                    if props.get("address"):
+                        st.write("**Addresses:**", "; ".join(props["address"][:3]))
+                    if props.get("innCode"):
+                        st.write("**INN(s) on file:**", ", ".join(f"`{i}`" for i in props["innCode"]))
+                    if props.get("bikCode"):
+                        st.write("**BIK(s) on file:**", ", ".join(f"`{b}`" for b in props["bikCode"]))
+                    if props.get("swiftBic"):
+                        st.write("**SWIFT(s) on file:**", ", ".join(f"`{s}`" for s in props["swiftBic"]))
+    else:
+        # ─── CLEAR ──────────────────────────────────────────────────────
+        st.success(
+            "## 🟢 CLEAR\n\n"
+            "**No OpenSanctions entity matches this bank on a strict identifier** "
+            "(BIK, SWIFT, or INN). The bank is not currently indexed in OpenSanctions "
+            "under any of its resolved identifiers.\n\n"
+            "_Caveat: this verdict is based on exact identifier matching. A bank "
+            "could in theory be sanctioned under a name/address only if OpenSanctions "
+            "hasn't yet attached structured identifiers to the entity — uncommon but "
+            "possible for newly-listed entities before metadata enrichment. For "
+            "elevated-risk transactions, also check the bank's name directly against "
+            "current sanctions list updates._"
+        )
 
+# ── Raw payload (debug) ──────────────────────────────────────────────────
 with st.expander("🔍 Raw payload (debug)"):
-    st.json(
-        {
-            "cbr": cbr,
-            "bik_info": bi,
-            "opensanctions": os_result,
-        }
-    )
+    debug_payload: dict[str, Any] = {
+        "cbr": cbr,
+        "bik_info": bi,
+        "identifiers_screened": {
+            "bics": list(all_bics),
+            "swifts": list(all_swifts),
+            "inn": inn_final,
+            "ogrn": ogrn_final,
+            "kpps": list(all_kpps),
+        },
+    }
+    if whitelist_hits:
+        debug_payload["whitelist_hits"] = whitelist_hits
+        debug_payload["opensanctions_strict_screening"] = "skipped (whitelisted)"
+    else:
+        debug_payload["opensanctions_strict_screening"] = screening
+    st.json(debug_payload)
