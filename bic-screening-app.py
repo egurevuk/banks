@@ -490,6 +490,84 @@ def iban_ru_swift_for_bic(bic: str) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 1 (assist): Dadata findById/bank — authoritative INN/KPP/OGRN/state
+# ─────────────────────────────────────────────────────────────────────────────
+
+DADATA_FIND_BANK_URL = (
+    "https://suggestions.dadata.ru/suggestions/api/4_1/rs/findById/bank"
+)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def dadata_find_bank(bic: str, api_key: str) -> dict[str, Any]:
+    """Look up a Russian bank by BIK using Dadata's findById/bank API.
+
+    Dadata is the authoritative commercial source for Russian legal-entity
+    reference data (it ingests CBR, FNS, and EGRUL feeds). For our pipeline
+    its main value is providing a reliable INN per BIK — CBR's SOAP sometimes
+    omits INN for branch BICs and bik-info.ru's INN field is inconsistent.
+
+    API contract: POST a JSON body ``{"query": "<BIC>"}`` with header
+    ``Authorization: Token <KEY>``. The response is
+    ``{"suggestions": [{"value": "...", "data": {...}}]}`` where ``data``
+    carries inn, kpp, ogrn, swift, registration_number, name (short/full/payment),
+    address, correspondent_account, state (status/actuality_date), etc.
+
+    Returns a flattened dict with the fields we care about, or
+    ``{"error": "..."}`` on auth/network/empty failures.
+
+    Cached for 1 hour — short enough to pick up bank-state changes (license
+    revocation matters) but long enough to keep cost low during burst screening.
+    """
+    if not api_key:
+        return {"error": "no_api_key"}
+    try:
+        r = requests.post(
+            DADATA_FIND_BANK_URL,
+            json={"query": bic},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Token {api_key}",
+            },
+            timeout=10,
+        )
+        if r.status_code in (401, 403):
+            return {"error": f"auth_failed_{r.status_code}"}
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        return {"error": f"request_failed: {e}"}
+
+    suggestions = payload.get("suggestions") or []
+    if not suggestions:
+        return {"error": "no_suggestions"}
+    first = suggestions[0]
+    d = first.get("data") or {}
+    name = d.get("name") if isinstance(d.get("name"), dict) else {}
+    address = d.get("address") if isinstance(d.get("address"), dict) else {}
+    state = d.get("state") if isinstance(d.get("state"), dict) else {}
+    return {
+        "value": first.get("value"),
+        "inn": d.get("inn"),
+        "kpp": d.get("kpp"),
+        "ogrn": d.get("ogrn"),
+        "swift": d.get("swift"),
+        "okpo": d.get("okpo"),
+        "reg_number": d.get("registration_number"),
+        "correspondent_account": d.get("correspondent_account"),
+        "name_short": name.get("short") if isinstance(name, dict) else None,
+        "name_full": name.get("full") if isinstance(name, dict) else None,
+        "name_payment": name.get("payment") if isinstance(name, dict) else None,
+        "name_english": name.get("english") if isinstance(name, dict) else None,
+        "address": address.get("value") if isinstance(address, dict) else None,
+        "state_status": state.get("status") if isinstance(state, dict) else None,
+        "state_actuality_date": state.get("actuality_date") if isinstance(state, dict) else None,
+        "raw_data": d,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 4 (assist): OhMySwift whitelist of non-sanctioned Russian banks
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1152,6 +1230,85 @@ with st.status("Step 1 · CBR: resolve BIC → internal code → SWIFT", expande
             "_(iban.ru: no SWIFT entry for this BIC — bank may not be on the table "
             "or the table doesn't cover this branch)_"
         )
+
+    # ── Dadata findById/bank — authoritative INN/KPP/OGRN/state ───────────
+    # Dadata sources from CBR + FNS + EGRUL, so it's the most reliable single
+    # source for the bank's INN. We merge what it returns into the cbr dict
+    # without overwriting any value CBR's SOAP already provided (CBR is the
+    # primary regulator-owned source; Dadata is the gap-filler).
+    try:
+        dadata_api_key = st.secrets.get("DADATA_API_KEY", "")
+    except Exception:
+        # Raises StreamlitSecretNotFoundError if no secrets.toml exists at all
+        # (typical for local dev without setup). Treat as "not configured".
+        dadata_api_key = ""
+    dadata = dadata_find_bank(bic, dadata_api_key) if dadata_api_key else {"error": "no_api_key"}
+    if dadata.get("error"):
+        if dadata["error"] == "no_api_key":
+            st.caption("_(Dadata: `DADATA_API_KEY` not configured in Streamlit secrets — skipping)_")
+        elif dadata["error"] == "no_suggestions":
+            st.caption(f"_(Dadata: no bank found for BIC `{bic}`)_")
+        elif dadata["error"].startswith("auth_failed"):
+            st.warning(f"⚠️ Dadata authentication failed ({dadata['error']}) — check `DADATA_API_KEY`")
+        else:
+            st.caption(f"_(Dadata: {dadata['error']})_")
+    else:
+        # Display the key identifiers as a single dense line
+        pieces = []
+        if dadata.get("inn"):
+            pieces.append(f"INN `{dadata['inn']}`")
+        if dadata.get("kpp"):
+            pieces.append(f"KPP `{dadata['kpp']}`")
+        if dadata.get("ogrn"):
+            pieces.append(f"OGRN `{dadata['ogrn']}`")
+        if dadata.get("reg_number"):
+            pieces.append(f"Reg# `{dadata['reg_number']}`")
+        if pieces:
+            st.markdown(f"🧾 **Dadata lookup:** {' · '.join(pieces)}")
+        if dadata.get("name_full") or dadata.get("name_english"):
+            name_line = dadata.get("name_full") or ""
+            if dadata.get("name_english"):
+                name_line = f"{name_line} _({dadata['name_english']})_" if name_line else dadata["name_english"]
+            st.caption(f"_Name (Dadata): {name_line}_")
+        # Bank state — important: a LIQUIDATING or LICENSE_REVOKED bank should
+        # not be transacted with, regardless of whether it's on a sanctions list.
+        status_val = dadata.get("state_status")
+        if status_val and status_val != "ACTIVE":
+            st.warning(
+                f"⚠️ **Dadata reports bank state: `{status_val}`** "
+                f"(as of {dadata.get('state_actuality_date') or 'unknown'}). "
+                "A non-active bank may not be able to receive or send payments."
+            )
+
+        # Merge Dadata findings into cbr dict — fill empty slots only, never
+        # overwrite. This way Step 3 (OpenSanctions match) and downstream
+        # logic see Dadata's values when CBR didn't provide them.
+        added_to_trace: list[str] = []
+        if dadata.get("inn") and not cbr.get("inn_cbr"):
+            cbr["inn_cbr"] = dadata["inn"]
+            added_to_trace.append(f"INN {dadata['inn']}")
+        if dadata.get("ogrn") and not cbr.get("ogrn_cbr"):
+            cbr["ogrn_cbr"] = dadata["ogrn"]
+            added_to_trace.append(f"OGRN {dadata['ogrn']}")
+        if dadata.get("kpp"):
+            kpp_list = list(cbr.get("kpp_codes_cbr") or [])
+            if dadata["kpp"] not in kpp_list:
+                kpp_list.append(dadata["kpp"])
+                cbr["kpp_codes_cbr"] = kpp_list
+                added_to_trace.append(f"KPP {dadata['kpp']}")
+        # Merge SWIFT into swift_codes pool, both 11- and 8-char forms
+        if dadata.get("swift"):
+            sw = dadata["swift"].strip().upper()
+            sw_pool = list(cbr.get("swift_codes") or [])
+            for s in [sw, sw + "XXX" if len(sw) == 8 else sw, sw[:8] if len(sw) == 11 else sw]:
+                if s and s not in sw_pool:
+                    sw_pool.append(s)
+                    added_to_trace.append(f"SWIFT {s}")
+            cbr["swift_codes"] = sw_pool
+        if added_to_trace:
+            cbr.setdefault("resolution_trace", []).append(
+                f"Dadata: added {', '.join(added_to_trace)}"
+            )
 
     if cbr.get("error"):
         st.warning(
