@@ -663,6 +663,22 @@ def check_whitelist_matches(swifts: list[str] | set[str]) -> list[tuple[str, str
 OPENSANCTIONS_ENTITY_URL = "https://api.opensanctions.org/entities/"
 OPENSANCTIONS_SEARCH_URL = "https://api.opensanctions.org/search/default"
 
+# US OFAC dataset identifiers in OpenSanctions. The OFAC distinction matters
+# for the verdict logic: a bank on OFAC's SDN list cannot transact in USD
+# through any US correspondent bank, while a bank on EU/UK/CH/JP sanctions
+# alone may still be reachable for non-USD flows. So a strict identifier hit
+# carrying OFAC coverage is 🔴 MATCH (block), while a hit without OFAC is
+# 🟡 REVIEW (manual judgement required). Other OFAC sub-lists like
+# `us_ofac_ns_pp` (Palestinian Legislative Council, sectoral) are not
+# included here since they don't apply to banks; if they should later, just
+# extend this set.
+OFAC_DATASETS: set[str] = {"us_ofac_sdn", "us_ofac_cons"}
+
+
+def entity_has_ofac(entity: dict[str, Any]) -> bool:
+    """True if the entity is listed in any OFAC dataset."""
+    return bool(set(entity.get("datasets") or []) & OFAC_DATASETS)
+
 
 def opensanctions_get_entity(api_key: str, entity_id: str) -> dict[str, Any] | None:
     """Fetch a single entity by its OpenSanctions canonical ID.
@@ -1295,7 +1311,8 @@ with st.sidebar:
     st.markdown(
         "**Verdict rules**  \n"
         "✅ **Whitelisted** — SWIFT on OhMySwift list  \n"
-        "🔴 **Match** — strict hit on BIK, SWIFT, or INN  \n"
+        "🔴 **Match** — strict hit AND on US OFAC  \n"
+        "🟡 **Review** — strict hit, no US OFAC  \n"
         "🟢 **Clear** — no whitelist, no strict hit"
     )
 
@@ -1794,14 +1811,56 @@ else:
 
     hits_by_id = screening["hits_by_entity_id"]
     if hits_by_id:
-        # ─── MATCH ──────────────────────────────────────────────────────
-        st.error(
-            f"## 🔴 MATCH\n\n"
-            f"**{len(hits_by_id)} OpenSanctions entity(ies) match this bank on a strict "
-            f"identifier (BIK, SWIFT, or INN).** Strict-identifier hits are near-certain "
-            "matches since these identifiers are globally unique per legal entity. "
-            "**Investigate each before transacting.**"
-        )
+        # ─── MATCH or REVIEW (depending on OFAC presence) ───────────────
+        # Per the spec: any hit means the bank's identifier is on a watchlist.
+        # The colour of the verdict depends on whether *any* matched entity
+        # has US OFAC coverage. OFAC is the strictest globally because it
+        # cuts off USD correspondent banking — a non-OFAC sanctions hit
+        # (EU/UK/CH/JP/CA/AU/UA only) still warrants manual review but may
+        # be transactable for non-USD flows.
+        ofac_entity_ids = {
+            eid for eid, h in hits_by_id.items() if entity_has_ofac(h["entity"])
+        }
+        n_ofac = len(ofac_entity_ids)
+        n_total = len(hits_by_id)
+        non_ofac_entity_ids = set(hits_by_id.keys()) - ofac_entity_ids
+
+        if ofac_entity_ids:
+            # 🔴 MATCH — at least one matched entity has US OFAC coverage
+            st.error(
+                f"## 🔴 MATCH — US OFAC sanctioned\n\n"
+                f"**{n_total} OpenSanctions entity(ies) match this bank on a strict "
+                f"identifier (BIK, SWIFT, or INN), and {n_ofac} of them is listed "
+                "on a US OFAC sanctions list** (SDN and/or Consolidated).\n\n"
+                "OFAC designation cuts off USD correspondent banking — US banks "
+                "are prohibited from processing transactions touching this entity. "
+                "**Do not transact in USD. Investigate before any flow.**"
+            )
+        else:
+            # 🟡 REVIEW — hits exist but none are OFAC
+            # Surface what jurisdictions DO appear, so the analyst sees what
+            # they're reviewing against
+            non_ofac_jurisdictions: set[str] = set()
+            for hit in hits_by_id.values():
+                bks = categorize_datasets(hit["entity"].get("datasets") or [])
+                for (flag, country) in bks["sanctions"].keys():
+                    non_ofac_jurisdictions.add(f"{flag} {country}")
+            juris_line = (
+                ", ".join(sorted(non_ofac_jurisdictions))
+                if non_ofac_jurisdictions
+                else "non-sanctions risk lists only (PEP/regulatory/debarment)"
+            )
+            st.warning(
+                f"## 🟡 REVIEW — non-OFAC match\n\n"
+                f"**{n_total} OpenSanctions entity(ies) match this bank on a strict "
+                "identifier (BIK, SWIFT, or INN), but none are listed by US OFAC.**\n\n"
+                f"Match jurisdictions: {juris_line}.\n\n"
+                "USD correspondent banking is not blocked by OFAC for this entity. "
+                "However, the bank is on a non-US sanctions, PEP, or risk list — "
+                "**manual review required** to decide whether the specific transaction "
+                "is permissible given the involved currencies, counterparties, and "
+                "your own jurisdictional exposure."
+            )
 
         # ── Top-level Sanctioning Jurisdictions (aggregated across all hits) ──
         agg_buckets = {"sanctions": {}, "counter_sanctions": {}, "other_risk": {}, "reference": [], "unmapped": []}
@@ -1852,14 +1911,24 @@ else:
         st.markdown("### Matched entities")
         # Identifier-type labels for prettier display
         PROP_LABEL = {"bikCode": "BIK", "swiftBic": "SWIFT", "innCode": "INN"}
-        for eid, hit in hits_by_id.items():
+        # Order: OFAC-listed entities first so the most severe matches read first
+        sorted_entity_ids = sorted(
+            hits_by_id.keys(),
+            key=lambda eid: 0 if eid in ofac_entity_ids else 1,
+        )
+        for eid in sorted_entity_ids:
+            hit = hits_by_id[eid]
             entity = hit["entity"]
             matches = hit["matches"]
             match_summary = " · ".join(
                 f"{PROP_LABEL.get(prop, prop)} `{val}`" for prop, val in matches
             )
+            # Per-entity colour: 🔴 if this entity itself has OFAC, 🟡 otherwise
+            entity_emoji = "🔴" if eid in ofac_entity_ids else "🟡"
+            ofac_tag = " · 🇺🇸 OFAC" if eid in ofac_entity_ids else ""
             with st.expander(
-                f"🔴 {entity.get('caption', '(no caption)')} · matched by {match_summary}"
+                f"{entity_emoji} {entity.get('caption', '(no caption)')} · "
+                f"matched by {match_summary}{ofac_tag}"
             ):
                 cols = st.columns([1, 2])
                 with cols[0]:
