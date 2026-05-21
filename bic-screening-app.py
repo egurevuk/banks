@@ -680,6 +680,41 @@ def entity_has_ofac(entity: dict[str, Any]) -> bool:
     return bool(set(entity.get("datasets") or []) & OFAC_DATASETS)
 
 
+# Keyword-to-head-office-BIK mapping. If the bank name contains one of these
+# keywords (case-insensitive), the BIK pool is extended with the head-office
+# BIK(s) of that bank. This rescues branch-BIK screenings: regional branches
+# of Sberbank/VTB have BIKs that OpenSanctions doesn't typically index,
+# whereas the head-office BIKs do, and they share the sanctions designation.
+# Applied in both the interactive Step 3 (with merged name variants from CBR)
+# and the bulk screener (with the single name from base.xml).
+SPECIAL_BANK_HEAD_OFFICE_BICS: dict[str, list[str]] = {
+    "SBERBANK": ["044525225"],
+    "СБЕРБАНК": ["044525225"],
+    "VTB":      ["044030707", "044525187"],
+    "ВТБ":      ["044030707", "044525187"],
+}
+
+
+def head_office_bics_for_name(name: str | None) -> list[str]:
+    """Return any head-office BIKs implied by keywords in the bank name.
+
+    Used to expand the BIK pool before strict OpenSanctions search so that
+    branch-BIK lookups still find the parent sanctioned entity.
+    """
+    if not name:
+        return []
+    h = name.upper()
+    out: list[str] = []
+    seen: set[str] = set()
+    for keyword, head_office_bics in SPECIAL_BANK_HEAD_OFFICE_BICS.items():
+        if keyword in h:
+            for b in head_office_bics:
+                if b not in seen:
+                    seen.add(b)
+                    out.append(b)
+    return out
+
+
 def opensanctions_get_entity(api_key: str, entity_id: str) -> dict[str, Any] | None:
     """Fetch a single entity by its OpenSanctions canonical ID.
 
@@ -1434,13 +1469,24 @@ def screen_bank_simple(
                 "detail": "no OpenSanctions API key",
             }
 
-        # 3. Strict identifier search — BIK, SWIFT, INN (validated)
+        # 3. Strict identifier search — BIK, SWIFT, INN (validated).
+        # Mirror the interactive Step 3 by expanding the BIK pool with
+        # head-office BICs when the bank name contains SBERBANK/VTB keywords.
+        # Without this, a Sberbank or VTB *branch* BIK from base.xml would
+        # screen as CLEAR because OpenSanctions indexes the head-office BIK
+        # not the branch BIKs — the interactive flow rescues these via name
+        # detection, so the bulk flow must do the same to stay consistent.
+        bik_pool: set[str] = {bik}
+        for hob in head_office_bics_for_name(name):
+            bik_pool.add(hob)
+
         hits: dict[str, dict] = {}
-        # BIK
-        r1 = opensanctions_search_by_property(api_key, "bikCode", bik)
-        for e in r1.get("results", []) or []:
-            if e.get("id"):
-                hits[e["id"]] = e
+        # BIK search — one per unique BIK in the expanded pool
+        for b in bik_pool:
+            rb = opensanctions_search_by_property(api_key, "bikCode", b)
+            for e in rb.get("results", []) or []:
+                if e.get("id"):
+                    hits[e["id"]] = e
         # SWIFT
         for s8 in swifts_8:
             rs = opensanctions_search_by_property(api_key, "swiftBic", s8)
@@ -1510,9 +1556,16 @@ def _register_cyrillic_font_for_pdf() -> str:
     Returns the registered font name, or "Helvetica" if no suitable font was
     found (in which case Cyrillic bank names will render as boxes — degraded
     but the PDF still produces correctly).
+
+    Imports are local because reportlab is an optional dependency only needed
+    when bulk PDFs are generated; the rest of the app shouldn't fail to load
+    if reportlab is missing from requirements.txt.
     """
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError:
+        return "Helvetica"
 
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -1544,15 +1597,28 @@ def generate_screening_pdf(
     Layout: cover paragraph with summary counts, then a single sorted table
     (red first, then yellow, then white, green, error). Row backgrounds are
     color-coded by verdict so the file is scannable when printed.
+
+    Raises a clear error message if reportlab is not installed — this is
+    common during initial deployment when ``requirements.txt`` hasn't been
+    refreshed alongside the source file.
     """
-    from io import BytesIO
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    )
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib import colors
-    from reportlab.lib.units import cm
+    try:
+        from io import BytesIO
+        from reportlab.lib.pagesizes import A4
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        )
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib import colors
+        from reportlab.lib.units import cm
+    except ImportError as exc:
+        raise RuntimeError(
+            f"reportlab not installed ({exc}). "
+            "Commit the updated `requirements.txt` (it must include "
+            "`reportlab>=4.0`) and reboot the Streamlit app — secrets "
+            "or settings changes don't pull new packages, a deploy push "
+            "or manual reboot does."
+        ) from exc
 
     font_name = _register_cyrillic_font_for_pdf()
     buffer = BytesIO()
@@ -2157,12 +2223,8 @@ with st.status("Step 3 · OpenSanctions /match — screening", expanded=True) as
     # with the head-office BICs of those banks. This ensures the head-office
     # entity is screened in OpenSanctions even when the entered BIC is a
     # regional branch or affiliate whose own BIK doesn't appear in OS.
-    SPECIAL_BANK_HEAD_OFFICE_BICS: dict[str, list[str]] = {
-        "SBERBANK": ["044525225"],
-        "СБЕРБАНК": ["044525225"],
-        "VTB":      ["044030707", "044525187"],
-        "ВТБ":      ["044030707", "044525187"],
-    }
+    # Mapping lives at module level (`SPECIAL_BANK_HEAD_OFFICE_BICS`) so the
+    # bulk screener uses the same rule and produces identical verdicts.
     # Concatenate all available name variants and uppercase once for
     # case-insensitive substring detection across Russian + transliterated forms.
     name_haystack = " ".join(
