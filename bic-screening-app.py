@@ -1850,6 +1850,216 @@ def generate_screening_pdf(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Custom Excel upload — screen a user-provided list of BICs
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Header names we'll auto-detect for the BIC column. Order-insensitive,
+# case-insensitive, substring-matched. Covers Russian/English/casual variants
+# that show up in payroll/vendor lists.
+_BIC_HEADER_KEYWORDS: tuple[str, ...] = (
+    "bank identification code",  # standard verbose form
+    "bik",                        # Russian transliteration
+    "bic",                        # international form
+    "бик",                        # Cyrillic
+)
+
+
+def _find_bic_column(df: "pd.DataFrame") -> str | None:
+    """Auto-detect which column in an uploaded DataFrame holds BICs.
+
+    Returns the column name, or None if no plausible BIC column was found.
+    """
+    for col in df.columns:
+        col_lower = str(col).lower().strip()
+        for kw in _BIC_HEADER_KEYWORDS:
+            if kw in col_lower:
+                return col
+    return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _build_bik_info_map() -> dict[str, dict[str, str]]:
+    """Build {BIK: {name, inn}} lookup from base.xml for in-memory name resolution.
+
+    Used by the custom Excel-upload flow so we can attach a bank name and INN
+    to each screened BIC without making per-BIC bik-info.ru calls. Reuses the
+    24h-cached base.xml fetch.
+    """
+    banks = fetch_bank_list_from_base_xml()
+    return {
+        b["bik"]: {"name": b.get("name", ""), "inn": b.get("inn", "")}
+        for b in banks
+    }
+
+
+def screen_uploaded_excel(
+    uploaded_bytes: bytes,
+    api_key: str,
+    progress_cb: "callable | None" = None,
+) -> "tuple[pd.DataFrame, dict[str, Any]]":
+    """Screen all BICs in an uploaded Excel and return an annotated DataFrame.
+
+    Reads every sheet of the uploaded ``.xlsx``, auto-detects the BIC column,
+    normalises BICs to 9-digit form (zero-pads 8-digit values), screens each
+    *unique* BIC via the cached ``screen_bank_simple``, and appends two
+    columns to the original data:
+
+      - ``Bank Name`` — from base.xml when available, blank otherwise
+      - ``Verdict`` — one of ✅ WHITELISTED / 🔴 MATCH / 🟡 REVIEW / 🟢 CLEAR
+        / ⚠️ ERROR, with a short detail in parentheses
+
+    The original columns are preserved unchanged. Rows without a BIC (or with
+    a malformed BIC) get blank verdict/name cells rather than rejecting the
+    whole file.
+
+    Returns ``(annotated_df, info)`` where ``info`` includes the BIC column
+    name, the per-verdict counts, and any errors encountered.
+    """
+    import io
+    df = pd.read_excel(io.BytesIO(uploaded_bytes), dtype=str)
+    bic_col = _find_bic_column(df)
+    if not bic_col:
+        return df, {
+            "error": (
+                "Couldn't auto-detect a BIC column. Expected a header "
+                "containing 'BIC', 'BIK', 'Bank Identification Code', or "
+                f"'БИК'. Found columns: {list(df.columns)}"
+            )
+        }
+
+    # Normalise: trim whitespace, drop non-digits, zero-pad 8-digit values to 9
+    def _normalise(raw: object) -> str | None:
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            return None
+        s = "".join(c for c in str(raw) if c.isdigit())
+        if not s:
+            return None
+        if len(s) == 8:
+            s = "0" + s
+        return s if len(s) == 9 else None
+
+    df["_bic_norm"] = df[bic_col].apply(_normalise)
+
+    bik_info_map = _build_bik_info_map()
+    # Filter to strings only — apply() returns None but pandas coerces None
+    # to NaN inside a Series, and `if b` doesn't catch NaN (it's truthy).
+    unique_bics = sorted({
+        b for b in df["_bic_norm"].tolist() if isinstance(b, str)
+    })
+
+    # Screen each unique BIC once (cached). The cache key includes the api_key
+    # so different keys get separate caches, but within a single run the same
+    # BIC repeated across rows costs us one screening, not N.
+    verdict_for: dict[str, dict[str, str]] = {}
+    name_for: dict[str, str] = {}
+    for i, bic in enumerate(unique_bics):
+        info = bik_info_map.get(bic, {})
+        name = info.get("name", "")
+        inn = info.get("inn", "")
+        verdict_for[bic] = screen_bank_simple(bic, name, inn, api_key)
+        name_for[bic] = name
+        if progress_cb is not None:
+            progress_cb(i + 1, len(unique_bics), bic, name, verdict_for[bic])
+
+    # Build the annotated columns. For rows without a BIC, leave cells blank.
+    def _verdict_cell(bic: str | None) -> str:
+        if not bic or bic not in verdict_for:
+            return ""
+        v = verdict_for[bic]
+        cell = f"{v['emoji']} {v['verdict']}"
+        if v.get("detail"):
+            cell += f" — {v['detail']}"
+        return cell
+
+    df["Bank Name"] = df["_bic_norm"].apply(
+        lambda b: name_for.get(b, "") if b else ""
+    )
+    df["Verdict"] = df["_bic_norm"].apply(_verdict_cell)
+
+    # Drop the helper column from the output
+    df = df.drop(columns=["_bic_norm"])
+
+    counts: dict[str, int] = {}
+    for v in verdict_for.values():
+        counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
+
+    return df, {
+        "bic_col": bic_col,
+        "n_unique": len(unique_bics),
+        "n_rows": len(df),
+        "counts": counts,
+        "error": None,
+    }
+
+
+def annotated_xlsx_bytes(df: "pd.DataFrame") -> bytes:
+    """Serialise an annotated DataFrame to .xlsx bytes for download.
+
+    Adds light formatting: bold header row, freeze the header, autosize
+    columns for legibility. No formulas (everything is final values).
+    """
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Screened"
+
+    # Header
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=str(col_name))
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", start_color="1F2937")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Data rows. Tint verdict cells by category so the file is scannable when
+    # opened in Excel.
+    verdict_tint = {
+        "MATCH":       "FEE2E2",  # light red
+        "REVIEW":      "FEF3C7",  # light amber
+        "WHITELISTED": "DCFCE7",  # light green
+        "CLEAR":       "F9FAFB",  # neutral light grey
+        "ERROR":       "E5E7EB",  # neutral grey
+    }
+    verdict_col_idx = None
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        if col_name == "Verdict":
+            verdict_col_idx = col_idx
+            break
+
+    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
+        for col_idx, value in enumerate(row, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value if pd.notna(value) else "")
+        # Tint the whole row by verdict
+        if verdict_col_idx is not None:
+            verdict_text = str(row[verdict_col_idx - 1] or "")
+            for key, hex_color in verdict_tint.items():
+                if key in verdict_text:
+                    for col_idx in range(1, len(df.columns) + 1):
+                        ws.cell(row=row_idx, column=col_idx).fill = PatternFill(
+                            "solid", start_color=hex_color
+                        )
+                    break
+
+    # Freeze header
+    ws.freeze_panes = "A2"
+
+    # Autosize columns (approximate — based on max content length)
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        max_len = max(
+            [len(str(col_name))]
+            + [len(str(v)) for v in df.iloc[:, col_idx - 1].fillna("").tolist()]
+        )
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 60)
+
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1911,6 +2121,48 @@ with st.sidebar:
             st.caption(
                 "_The first run takes a few minutes (one /search per bank). "
                 "Subsequent runs reuse the per-bank cache (1h TTL)._"
+            )
+
+    # ── Custom Excel upload: screen a user-provided list ──────────────
+    with st.expander("📋 Custom list (Excel)", expanded=False):
+        st.caption(
+            "Upload an `.xlsx` with a BIC column and get it back with "
+            "**Verdict** and **Bank Name** columns appended. The BIC column "
+            "is auto-detected (header containing _BIC_, _BIK_, _Bank "
+            "Identification Code_, or _БИК_). 8-digit BICs are zero-padded "
+            "to 9 digits. Same verdict logic as the single-BIC screening."
+        )
+        custom_file = st.file_uploader(
+            "Upload .xlsx", type=["xlsx"], key="custom_upload",
+            label_visibility="collapsed",
+        )
+        if custom_file is not None:
+            if st.button(
+                "🔄 Screen this list", use_container_width=True, key="custom_run_btn"
+            ):
+                # Save file bytes for the gate to read. We capture bytes
+                # rather than the file handle because the handle doesn't
+                # survive across reruns.
+                st.session_state["custom_upload_bytes"] = custom_file.getvalue()
+                st.session_state["custom_upload_filename"] = custom_file.name
+                st.session_state["custom_upload_run"] = True
+                st.session_state["custom_xlsx"] = None
+        if st.session_state.get("custom_xlsx"):
+            orig_name = st.session_state.get(
+                "custom_upload_filename", "uploaded.xlsx"
+            )
+            base_name = orig_name.rsplit(".", 1)[0]
+            st.success(
+                f"Annotated file ready · {st.session_state.get('custom_n_rows', '?')} "
+                f"rows · {st.session_state.get('custom_n_unique', '?')} unique BICs"
+            )
+            st.download_button(
+                "⬇️ Download annotated .xlsx",
+                data=st.session_state["custom_xlsx"],
+                file_name=f"{base_name}_screened.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="custom_download_btn",
             )
 
 # ── Bulk PDF generation (runs in place of regular screening) ─────────────
@@ -2028,6 +2280,125 @@ if st.session_state.get("bulk_pdf_run") and not st.session_state.get("bulk_pdf")
         "interaction with the app (e.g. screening a single BIC). The PDF "
         "stays available for the rest of this browser session._"
     )
+    st.stop()
+
+# ── Custom Excel screening (runs in place of regular screening) ──────────
+# Triggered by the sidebar uploader + "Screen this list" button which sets
+# session_state["custom_upload_run"]. We handle it here, before the regular
+# BIC input, so the user doesn't also need to enter a single BIC. The final
+# `st.stop()` prevents the regular screening UI from rendering on top.
+if st.session_state.get("custom_upload_run") and not st.session_state.get("custom_xlsx"):
+    st.markdown("## 📋 Custom list — screening")
+    st.caption(
+        f"Processing **{st.session_state.get('custom_upload_filename', 'uploaded file')}** "
+        "with the same verdict logic as the interactive tool: input-SWIFT "
+        "whitelist → strict identifier search (BIK / SWIFT / INN) → "
+        "OS-SWIFT whitelist → OFAC split."
+    )
+
+    cu_progress = st.progress(0.0)
+    cu_status = st.empty()
+    cu_status.info("Step 1/2 · Reading the uploaded Excel and detecting BIC column…")
+
+    try:
+        # Pre-flight: peek at the file to give the user immediate feedback
+        # about the detected BIC column and total rows.
+        import io as _io
+        peek_df = pd.read_excel(
+            _io.BytesIO(st.session_state["custom_upload_bytes"]), dtype=str
+        )
+        peek_col = _find_bic_column(peek_df)
+        if not peek_col:
+            st.error(
+                "Couldn't auto-detect a BIC column. Expected a header "
+                "containing _BIC_, _BIK_, _Bank Identification Code_, or "
+                f"_БИК_. Found columns: `{list(peek_df.columns)}`. "
+                "Rename your BIC column to one of those and re-upload."
+            )
+            st.session_state["custom_upload_run"] = False
+            st.stop()
+
+        # Count unique BICs upfront so we can show meaningful progress
+        unique_norm = sorted({
+            ("0" + "".join(c for c in str(b) if c.isdigit())[:8])
+            if len("".join(c for c in str(b) if c.isdigit())) == 8
+            else "".join(c for c in str(b) if c.isdigit())
+            for b in peek_df[peek_col].dropna().tolist()
+            if "".join(c for c in str(b) if c.isdigit())
+        })
+        unique_norm = [b for b in unique_norm if len(b) == 9]
+        cu_status.info(
+            f"Step 1/2 · ✓ BIC column: **{peek_col}** · "
+            f"{len(peek_df)} rows · {len(unique_norm)} unique BICs"
+        )
+
+        # Per-BIC progress callback. Updates the progress bar and the status
+        # line as each unique BIC is screened.
+        def _progress_cb(i: int, total: int, bic: str, name: str, verdict: dict):
+            cu_progress.progress(i / max(1, total))
+            short_name = (name or "(unnamed)")[:60]
+            cu_status.info(
+                f"Step 2/2 · {i}/{total} — `{bic}` {short_name} → "
+                f"{verdict['emoji']} {verdict['verdict']}"
+            )
+
+        annotated_df, info = screen_uploaded_excel(
+            st.session_state["custom_upload_bytes"],
+            OPENSANCTIONS_API_KEY,
+            progress_cb=_progress_cb,
+        )
+
+        if info.get("error"):
+            st.error(info["error"])
+            st.session_state["custom_upload_run"] = False
+            st.stop()
+
+        # Serialise to xlsx and persist for the sidebar download button
+        xlsx_bytes = annotated_xlsx_bytes(annotated_df)
+        st.session_state["custom_xlsx"] = xlsx_bytes
+        st.session_state["custom_n_rows"] = info["n_rows"]
+        st.session_state["custom_n_unique"] = info["n_unique"]
+        st.session_state["custom_upload_run"] = False
+
+        cu_progress.empty()
+        cu_status.success(
+            f"✅ Annotated file ready — {info['n_rows']} rows, "
+            f"{info['n_unique']} unique BICs screened."
+        )
+
+        # Inline download button (mirrors the bulk-PDF UX — sidebar version
+        # appears on next rerun)
+        orig_name = st.session_state.get("custom_upload_filename", "uploaded.xlsx")
+        base_name = orig_name.rsplit(".", 1)[0]
+        st.download_button(
+            "⬇️ Download annotated .xlsx",
+            data=xlsx_bytes,
+            file_name=f"{base_name}_screened.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            key="custom_inline_download",
+        )
+
+        # Verdict count summary
+        counts = info.get("counts", {})
+        summary = " · ".join(
+            f"{VERDICT_EMOJI[k]} **{k}**: {counts.get(k, 0)}"
+            for k in (VERDICT_MATCH, VERDICT_REVIEW, VERDICT_WHITELISTED,
+                      VERDICT_CLEAR, VERDICT_ERROR)
+            if counts.get(k, 0) > 0
+        )
+        if summary:
+            st.markdown("**Across unique BICs:** " + summary)
+
+        # Show a preview of the annotated data
+        st.markdown("### Preview")
+        st.dataframe(annotated_df, use_container_width=True, hide_index=True)
+
+    except Exception as exc:
+        st.error(f"Screening failed: {exc}")
+        st.session_state["custom_upload_run"] = False
+        st.stop()
+
     st.stop()
 
 col1, col2 = st.columns([3, 1])
