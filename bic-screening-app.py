@@ -429,12 +429,15 @@ def bik_info_lookup(bic: str) -> dict[str, Any]:
 IBAN_RU_SWIFT_URL = "https://www.iban.ru/swift-bic-kodov"
 
 # After stripping HTML tags and pipe separators, SWIFT and BIK appear as adjacent
-# whitespace-separated tokens. SWIFT BIC: 4 letters (institution) + 2 letters
-# (country) + 2 alphanumeric (location) + optional 3 alphanumeric (branch) — so
-# 8 or 11 chars. BIK: 9 digits. Word boundaries on both ends prevent false
-# matches against longer runs.
+# whitespace-separated tokens. SWIFT BIC: 4 letters (institution) + 'RU' (country
+# for Russian banks) + 2 alphanumeric (location) + optional 3 alphanumeric
+# (branch) — so 8 or 11 chars. BIK: 9 digits. Country code is anchored to 'RU'
+# specifically because this is the Russian iban.ru directory — every SWIFT here
+# is Russian by definition, and the RU anchor prevents theoretical false
+# positives against Latin-script text that happens to fit the generic shape
+# (e.g. bank names like SBERBANK also match [A-Z]{4}[A-Z]{2}[A-Z0-9]{2}).
 IBAN_RU_PAIR_RE = re.compile(
-    r"\b([A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\s+(\d{9})\b"
+    r"\b([A-Z]{4}RU[A-Z0-9]{2}(?:[A-Z0-9]{3})?)\s+(\d{9})\b"
 )
 
 
@@ -1396,10 +1399,9 @@ with st.sidebar:
         )
     st.markdown(
         "**Verdict rules**  \n"
-        "✅ **Whitelisted** — SWIFT on OhMySwift list  \n"
+        "🟢 **Clear** — SWIFT on OhMySwift list OR no strict hit  \n"
         "🔴 **Match** — strict hit AND on US OFAC  \n"
-        "🟡 **Review** — strict hit, no US OFAC  \n"
-        "🟢 **Clear** — no whitelist, no strict hit"
+        "🟡 **Review** — strict hit, no US OFAC"
     )
 
 # ── Regular single-BIC screening ─────────────────────────────────────────
@@ -1896,15 +1898,16 @@ with bank_summary_placeholder.container():
 st.markdown("## Step 4 · Verdict")
 st.caption(
     "Verdict logic: **(1)** if any SWIFT matches the OhMySwift whitelist of "
-    "Russian banks NOT under US/EU sanctions → ✅ WHITELISTED. **(2)** otherwise, "
-    "run a strict OpenSanctions search on BIK, SWIFT, and INN — any hit → 🔴 MATCH; "
-    "no hits → 🟢 CLEAR."
+    "Russian banks NOT under US/EU sanctions → 🟢 CLEAR (short-circuit — "
+    "no OpenSanctions calls needed). **(2)** otherwise, run a strict "
+    "OpenSanctions search on BIK, SWIFT, and INN — any hit on US OFAC → "
+    "🔴 MATCH; hit without OFAC → 🟡 REVIEW; no hits → 🟢 CLEAR."
 )
 
 # ── (1) Whitelist check ──────────────────────────────────────────────────
 # Cross-reference the bank's resolved SWIFTs against the OhMySwift curated
 # list of Russian banks NOT under US (SDN) and EU sanctions. If matched, we
-# short-circuit and skip the OpenSanctions calls entirely — that's the spec.
+# short-circuit and skip the OpenSanctions calls entirely.
 whitelist_hits = check_whitelist_matches(swift_pool)
 if whitelist_hits:
     hits_str = "\n".join(
@@ -1912,18 +1915,19 @@ if whitelist_hits:
         for swift_8, name in whitelist_hits
     )
     st.success(
-        "## ✅ WHITELISTED\n\n"
-        "This bank's SWIFT appears on the curated list of **Russian banks NOT under "
-        "US (SDN) and EU sanctions**:\n\n"
+        "## 🟢 CLEAR\n\n"
+        "This bank's SWIFT appears on the curated list of **Russian banks "
+        "NOT under US (SDN) and EU sanctions**, so the bank is cleared "
+        "without needing further screening:\n\n"
         f"{hits_str}\n\n"
         "_Source: [ohmyswift.io/ne-pod-sankciyami-spisok]"
         "(https://ohmyswift.io/ne-pod-sankciyami-spisok) — Russian banks "
         "confirmed absent from the US SDN list and EU consolidated sanctions "
         "(fetched live, cached 24h)._\n\n"
-        "_Per the verdict spec, OpenSanctions strict-identifier search is skipped "
-        "when whitelisted. The whitelist covers US + EU only — if you need to "
-        "verify against UK, JP, CA, AU, CH, or UA sanctions specifically, run an "
-        "ad-hoc OpenSanctions lookup outside this tool._"
+        "_OpenSanctions strict-identifier search is skipped when a bank is "
+        "on this whitelist. The whitelist covers US + EU only — if you need "
+        "to verify against UK, JP, CA, AU, CH, or UA sanctions specifically, "
+        "run an ad-hoc OpenSanctions lookup outside this tool._"
     )
 
 else:
@@ -2009,7 +2013,7 @@ else:
 
     if os_whitelisted_entities:
         # Surface what was filtered, so the analyst sees that some OpenSanctions
-        # entities matched on identifier but were re-cleared via SWIFT-whitelist.
+        # entities matched on identifier but were cleared via SWIFT-whitelist.
         n_wl = len(os_whitelisted_entities)
         names_str = ", ".join(
             f"_{h['entity'].get('caption', '(no caption)')}_"
@@ -2018,9 +2022,9 @@ else:
         if n_wl > 3:
             names_str += f" (+{n_wl - 3} more)"
         st.info(
-            f"✅ **{n_wl} OpenSanctions entity(ies) matched on identifier but "
-            "their OS-stored SWIFT is on the OhMySwift whitelist** — treating "
-            f"as whitelisted, not counting toward MATCH/REVIEW verdict: {names_str}"
+            f"🟢 **{n_wl} OpenSanctions entity(ies) matched on identifier but "
+            "their OS-stored SWIFT is on the OhMySwift whitelist** — cleared "
+            f"via whitelist, not counting toward MATCH/REVIEW verdict: {names_str}"
         )
 
     if hits_by_id:
@@ -2187,11 +2191,12 @@ else:
                     if props.get("swiftBic"):
                         st.write("**SWIFT(s) on file:**", ", ".join(f"`{s}`" for s in props["swiftBic"]))
     else:
-        # No surviving hits. Distinguish two sub-cases:
-        # (a) There were no strict identifier hits at all → 🟢 CLEAR
-        # (b) There were hits but all got OS-whitelisted via swiftBic → ✅
+        # No surviving hits. Two sub-cases share the same CLEAR verdict:
+        # (a) No strict identifier hits at all
+        # (b) Hits existed but all matched entities have OS-stored SWIFTs on
+        #     the OhMySwift whitelist → cleared via whitelist
         if os_whitelisted_entities:
-            # ─── ✅ WHITELISTED (via OS-SWIFT post-filter) ──────────────
+            # ─── 🟢 CLEAR (via OS-side SWIFT whitelist) ─────────────────
             wl_lines = "\n".join(
                 f"- _{h['entity'].get('caption', '(no caption)')}_ "
                 f"(OS-stored SWIFT: "
@@ -2199,12 +2204,13 @@ else:
                 for h in os_whitelisted_entities.values()
             )
             st.success(
-                "## ✅ WHITELISTED\n\n"
+                "## 🟢 CLEAR\n\n"
                 f"OpenSanctions returned **{len(os_whitelisted_entities)} entity(ies)** "
                 "matching this bank on strict identifier, **but every one of them "
                 "has an OS-stored SWIFT that's on the OhMySwift whitelist** — i.e. "
                 "the matched legal entities are themselves on the curated list of "
-                "Russian banks not under US (SDN) and EU sanctions.\n\n"
+                "Russian banks not under US (SDN) and EU sanctions, so the bank "
+                "is cleared:\n\n"
                 f"{wl_lines}\n\n"
                 "_The strict-search hits here are most likely OpenSanctions' own "
                 "Russian bank reference records (`ru_cbr_banks` dataset), not "
