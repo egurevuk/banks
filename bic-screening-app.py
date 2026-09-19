@@ -21,7 +21,6 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Any
 
-import pandas as pd
 import requests
 import streamlit as st
 
@@ -571,63 +570,115 @@ def dadata_find_bank(bic: str, api_key: str) -> dict[str, Any]:
 # Step 4 (assist): OhMySwift whitelist of non-sanctioned Russian banks
 # ─────────────────────────────────────────────────────────────────────────────
 
-# File name (kept in the repo root alongside the script). The xlsx is a
-# curated list — col[0] is the 8-char SWIFT BIC, col[1] is the Russian bank
-# name, col[2] is the English name. Header/navigation rows are at the top and
-# we skip them by filtering for the SWIFT regex on col[0].
-WHITELIST_XLSX_FILENAME = "Ohmyswift.xlsx"
-
 # Strict 8-char SWIFT pattern: 4 letters (institution) + 2 letters (country)
-# + 2 alphanumeric (location). The whitelist file uses 8-char form throughout.
+# + 2 alphanumeric (location). The whitelist page uses this form throughout.
 SWIFT_8_RE = re.compile(r"^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}$")
+
+# Russia-specific 8-char SWIFT pattern used by the whitelist parser. Requires
+# the country code to be literally 'RU' — the generic 8-char SWIFT pattern
+# accepts any 2-letter country code, which false-positives on cells like
+# 'SBERBANK' (SBER + BA + NK fits the generic shape but has no RU anchor).
+SWIFT_RU_8_RE = re.compile(r"^[A-Z]{4}RU[A-Z0-9]{2}$")
+
+# Russian SWIFT pattern (8-char or 11-char) for scanning the whitelist HTML.
+# The middle two chars are always "RU" for Russia; the location + optional
+# branch codes may be alphanumeric. Word boundaries prevent matching inside
+# longer alphanumeric strings.
+SWIFT_RU_SCAN_RE = re.compile(r"\b([A-Z]{4}RU[A-Z0-9]{2})(?:[A-Z0-9]{3})?\b")
+
+# Live source for the "Russian banks NOT under US/EU sanctions" list.
+# Replaces the local Ohmyswift.xlsx snapshot so the whitelist reflects
+# whatever ohmyswift.io currently publishes rather than a frozen file.
+OHMYSWIFT_WHITELIST_URL = "https://ohmyswift.io/ne-pod-sankciyami-spisok"
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_whitelist_swifts() -> dict[str, str]:
-    """Load the curated 'Russian banks NOT under US/EU sanctions' SWIFT list.
+    """Fetch the curated 'Russian banks NOT under US/EU sanctions' SWIFT list.
 
-    Returns a dict {SWIFT_8char: bank_display_name}. The file is the iban.ru-
-    sourced 'Российские банки не под санкциями США и ЕС' compilation — Russian
-    banks confirmed absent from both the US SDN list and EU sanctions lists.
+    Live source: ``https://ohmyswift.io/ne-pod-sankciyami-spisok`` — the
+    ohmyswift.io compilation of Russian banks confirmed absent from both the
+    US SDN list and EU sanctions lists. Fetching live means the whitelist
+    reflects the latest ohmyswift.io publication instead of a frozen file
+    checked into the repo.
 
-    File expectations:
-      - Sheet 0, no header (we read header=None and filter rows by content)
-      - Column 0: 8-char SWIFT BIC (skips rows where col[0] doesn't match)
-      - Column 1: Russian bank name (used if English unavailable)
-      - Column 2: English bank name (preferred for display)
+    Returns a dict ``{SWIFT_8char: bank_display_name}``. The bank name is
+    best-effort: extracted from the HTML row containing each SWIFT via a
+    two-pronged approach (BeautifulSoup table parse when the layout is
+    tabular, regex fallback otherwise). When no name can be extracted the
+    SWIFT itself is returned as the display value — the verdict logic uses
+    the SWIFT as the key, so the name is a display convenience only.
 
-    Lookup is attempted from multiple paths so the file can live alongside
-    the script (production) or in the upload folder (dev/Claude environment).
+    Cached for 24h — the whitelist itself rarely changes and this avoids
+    hammering ohmyswift.io on every screening.
 
-    Cached for 24h — the whitelist itself rarely changes.
+    Fetch failures return an empty dict; the app degrades gracefully to
+    "nothing matches the whitelist", which drives all banks through the
+    strict-search path rather than crashing.
     """
-    candidate_paths = [
-        WHITELIST_XLSX_FILENAME,                                   # cwd
-        os.path.join(os.path.dirname(__file__), WHITELIST_XLSX_FILENAME),
-        os.path.join("/mnt/user-data/uploads", WHITELIST_XLSX_FILENAME),
-    ]
-    df = None
-    for path in candidate_paths:
-        if os.path.exists(path):
-            try:
-                df = pd.read_excel(path, sheet_name=0, dtype=str, header=None)
-                break
-            except Exception:
-                continue
-    if df is None or df.empty:
+    try:
+        r = requests.get(
+            OHMYSWIFT_WHITELIST_URL,
+            timeout=30,
+            headers={
+                # Some sites gate on a real UA; the default requests UA
+                # gets 403'd in a fair number of cases.
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; KleosBICScreening/1.0; "
+                    "+https://kleos.io)"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en,ru;q=0.9",
+            },
+        )
+        r.raise_for_status()
+        html = r.text
+    except Exception:
         return {}
 
     out: dict[str, str] = {}
-    for _, row in df.iterrows():
-        cell = row.iloc[0] if len(row) > 0 else None
-        if not isinstance(cell, str):
-            continue
-        swift = cell.strip().upper()
-        if not SWIFT_8_RE.match(swift):
-            continue  # header/navigation rows fail this filter
-        name_en = row.iloc[2] if len(row) > 2 and isinstance(row.iloc[2], str) else ""
-        name_ru = row.iloc[1] if len(row) > 1 and isinstance(row.iloc[1], str) else ""
-        out[swift] = (name_en or name_ru or "").strip()
+
+    # Primary approach: BeautifulSoup table parse. When the page renders as
+    # a tabular list (which is how iban.ru-derived compilations typically
+    # publish), we get bank name + SWIFT paired per row.
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+        soup = BeautifulSoup(html, "html.parser")
+        for row in soup.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
+            row_swift: str | None = None
+            row_names: list[str] = []
+            for cell in cells:
+                cell_u = cell.strip().upper()
+                # A cell is a Russian SWIFT if it matches the RU-anchored
+                # pattern in 8-char or 11-char form. The generic 8-char SWIFT
+                # shape (any 2-letter country code) would false-positive on
+                # bank-name cells like 'SBERBANK' — SBER+BA+NK fits the
+                # generic pattern but has no RU anchor.
+                if SWIFT_RU_8_RE.match(cell_u[:8]) and len(cell_u) in (8, 11):
+                    row_swift = cell_u[:8]
+                else:
+                    # Any other non-empty cell becomes a name candidate
+                    if cell:
+                        row_names.append(cell)
+            if row_swift and row_swift not in out:
+                # Prefer the longest name-candidate cell (usually the bank name;
+                # short cells like "1" or "PJSC" tend to be indices or forms)
+                name = ""
+                if row_names:
+                    name = max(row_names, key=len)
+                out[row_swift] = name
+    except Exception:
+        pass
+
+    # Fallback: regex-scan the whole page text for any Russian SWIFT that
+    # wasn't picked up by the table parser. This catches list-style layouts,
+    # inline mentions, and pages where the tabular structure isn't standard.
+    for m in SWIFT_RU_SCAN_RE.finditer(html.upper()):
+        swift_8 = m.group(1)
+        if swift_8 not in out:
+            out[swift_8] = ""
+
     return out
 
 
@@ -1319,747 +1370,6 @@ def categorize_datasets(datasets: list[str] | None) -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bulk screening: fetch full bank list, screen each, render PDF
-# ─────────────────────────────────────────────────────────────────────────────
-
-BIK_INFO_BASE_XML_URL = "https://bik-info.ru/base/base.xml"
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_bank_list_from_base_xml() -> list[dict[str, str]]:
-    """Fetch and parse the full list of Russian banks from bik-info.ru/base.xml.
-
-    Returns a list of dicts ``[{"bik": "...", "name": "...", "inn": "..."}, ...]``.
-    Deduplicates by BIK (the registry's natural primary key) and only includes
-    rows where BIK is a valid 9-digit numeric string.
-
-    The parser is intentionally defensive: bik-info.ru's XML schema isn't
-    documented publicly and could express bank data either as element children
-    (``<bank><bik>X</bik><name>Y</name></bank>``) or as attributes (``<bank
-    bik="X" name="Y"/>``). The function walks every element in the tree,
-    extracts candidate fields from both attributes and children, and accepts
-    any element that yielded a BIK-shaped value. Multiple namespace prefixes
-    are stripped via the ``}`` split for the same reason.
-
-    Cached for 24 hours since the bank registry only changes when CBR
-    licenses, revokes, or merges banks (handful of events per year).
-    """
-    try:
-        r = requests.get(BIK_INFO_BASE_XML_URL, timeout=60)
-        r.raise_for_status()
-    except Exception:
-        return []
-    try:
-        root = ET.fromstring(r.content)
-    except Exception:
-        return []
-
-    def _extract_fields(elem: ET.Element) -> dict[str, str]:
-        data: dict[str, str] = {}
-        # Attributes — strip namespace prefixes if any
-        for attr_name, attr_value in (elem.attrib or {}).items():
-            key = attr_name.lower().split("}")[-1]
-            val = (attr_value or "").strip()
-            if not val:
-                continue
-            if key in ("bik", "bic") and not data.get("bik"):
-                data["bik"] = val
-            elif key in ("name", "namebank", "shortname", "bank_name") and not data.get("name"):
-                data["name"] = val
-            elif key in ("namep", "fullname", "name_full") and not data.get("name_full"):
-                data["name_full"] = val
-            elif key in ("inn", "innbank") and not data.get("inn"):
-                data["inn"] = val
-        # Children
-        for child in elem:
-            tag = (child.tag or "").lower().split("}")[-1]
-            text = (child.text or "").strip()
-            if not text:
-                continue
-            if tag in ("bik", "bic") and not data.get("bik"):
-                data["bik"] = text
-            elif tag in ("name", "namebank", "shortname", "bank_name") and not data.get("name"):
-                data["name"] = text
-            elif tag in ("namep", "fullname", "name_full") and not data.get("name_full"):
-                data["name_full"] = text
-            elif tag in ("inn", "innbank") and not data.get("inn"):
-                data["inn"] = text
-        return data
-
-    banks: list[dict[str, str]] = []
-    seen_biks: set[str] = set()
-    for elem in root.iter():
-        data = _extract_fields(elem)
-        bik = data.get("bik", "")
-        if len(bik) != 9 or not bik.isdigit() or bik in seen_biks:
-            continue
-        seen_biks.add(bik)
-        # Promote name_full to name if we don't have a shorter name
-        if not data.get("name") and data.get("name_full"):
-            data["name"] = data["name_full"]
-        banks.append(data)
-    return banks
-
-
-# Verdict-state constants for the bulk-screening path. Mirror the colour
-# scheme used in Step 4's UI.
-VERDICT_WHITELISTED = "WHITELISTED"
-VERDICT_MATCH = "MATCH"           # 🔴 strict hit AND OFAC
-VERDICT_REVIEW = "REVIEW"         # 🟡 strict hit, no OFAC
-VERDICT_CLEAR = "CLEAR"           # 🟢 no strict hit
-VERDICT_ERROR = "ERROR"           # ⚠️ screening failed (network/parse/etc)
-
-VERDICT_EMOJI: dict[str, str] = {
-    VERDICT_WHITELISTED: "✅",
-    VERDICT_MATCH: "🔴",
-    VERDICT_REVIEW: "🟡",
-    VERDICT_CLEAR: "🟢",
-    VERDICT_ERROR: "⚠️",
-}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def screen_bank_simple(
-    bik: str,
-    name: str,
-    inn: str,
-    api_key: str,
-) -> dict[str, str]:
-    """Headless verdict for a single bank — used by the bulk PDF generator.
-
-    Same verdict logic as the interactive Step 4 (whitelist → strict-search →
-    OS-side whitelist → OFAC split), but without UI side effects so it can be
-    called in a tight loop over hundreds of banks.
-
-    Caching: 1h TTL per (bik, name, inn, api_key) tuple. The TTL is shorter
-    than the 24h on ``fetch_bank_list_from_base_xml`` because sanctions lists
-    can change overnight (mid-week OFAC updates are common) and the bulk
-    PDF should pick those up promptly when regenerated.
-
-    Returns ``{"verdict": str, "emoji": str, "detail": str}`` where verdict
-    is one of the ``VERDICT_*`` constants and detail is a short human-readable
-    explanation suitable for a PDF cell.
-    """
-    try:
-        whitelist = load_whitelist_swifts()
-        wl_swifts = set(whitelist.keys())
-
-        # 1. Resolve SWIFT from iban.ru (the cheap cached lookup; we don't
-        # call CBR/Dadata in bulk mode to keep the per-bank cost minimal)
-        iban_swift = iban_ru_swift_for_bic(bik)
-        swifts_8: set[str] = set()
-        if iban_swift:
-            s8 = iban_swift[:8].upper()
-            if re.match(r"^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}$", s8):
-                swifts_8.add(s8)
-
-        # 2. Input-side whitelist check
-        wl_hit = swifts_8 & wl_swifts
-        if wl_hit:
-            return {
-                "verdict": VERDICT_WHITELISTED,
-                "emoji": VERDICT_EMOJI[VERDICT_WHITELISTED],
-                "detail": f"SWIFT {next(iter(wl_hit))} on OhMySwift",
-            }
-
-        if not api_key:
-            return {
-                "verdict": VERDICT_ERROR,
-                "emoji": VERDICT_EMOJI[VERDICT_ERROR],
-                "detail": "no OpenSanctions API key",
-            }
-
-        # 3. Strict identifier search — BIK, SWIFT, INN (validated).
-        # Mirror the interactive Step 3 by expanding the BIK pool with
-        # head-office BICs when the bank name contains SBERBANK/VTB keywords.
-        # Without this, a Sberbank or VTB *branch* BIK from base.xml would
-        # screen as CLEAR because OpenSanctions indexes the head-office BIK
-        # not the branch BIKs — the interactive flow rescues these via name
-        # detection, so the bulk flow must do the same to stay consistent.
-        bik_pool: set[str] = {bik}
-        for hob in head_office_bics_for_name(name):
-            bik_pool.add(hob)
-
-        hits: dict[str, dict] = {}
-        # BIK search — one per unique BIK in the expanded pool
-        for b in bik_pool:
-            rb = opensanctions_search_by_property(api_key, "bikCode", b)
-            for e in rb.get("results", []) or []:
-                if e.get("id"):
-                    hits[e["id"]] = e
-        # SWIFT
-        for s8 in swifts_8:
-            rs = opensanctions_search_by_property(api_key, "swiftBic", s8)
-            for e in rs.get("results", []) or []:
-                if e.get("id"):
-                    hits[e["id"]] = e
-        # INN (validate first)
-        clean_inn = "".join(c for c in str(inn or "") if c.isdigit())
-        if len(clean_inn) in (10, 12):
-            ri = opensanctions_search_by_property(api_key, "innCode", clean_inn)
-            for e in ri.get("results", []) or []:
-                if e.get("id"):
-                    hits[e["id"]] = e
-
-        # 4. OS-side per-entity whitelist filter — if an entity's OS-stored
-        # SWIFT is on the OhMySwift list, treat it as whitelisted
-        real_hits: dict[str, dict] = {}
-        any_os_wl = False
-        for eid, entity in hits.items():
-            entity_swifts = (entity.get("properties") or {}).get("swiftBic") or []
-            e8 = {s.strip().upper()[:8] for s in entity_swifts if isinstance(s, str) and len(s.strip()) >= 8}
-            if e8 & wl_swifts:
-                any_os_wl = True
-                continue
-            real_hits[eid] = entity
-
-        if not real_hits:
-            if any_os_wl:
-                return {
-                    "verdict": VERDICT_WHITELISTED,
-                    "emoji": VERDICT_EMOJI[VERDICT_WHITELISTED],
-                    "detail": "OS-side: matched entity SWIFT on whitelist",
-                }
-            return {
-                "verdict": VERDICT_CLEAR,
-                "emoji": VERDICT_EMOJI[VERDICT_CLEAR],
-                "detail": "no strict identifier match",
-            }
-
-        # 5. OFAC split
-        if any(entity_has_ofac(e) for e in real_hits.values()):
-            return {
-                "verdict": VERDICT_MATCH,
-                "emoji": VERDICT_EMOJI[VERDICT_MATCH],
-                "detail": f"OFAC sanctioned ({len(real_hits)} entity)",
-            }
-        return {
-            "verdict": VERDICT_REVIEW,
-            "emoji": VERDICT_EMOJI[VERDICT_REVIEW],
-            "detail": f"non-OFAC match ({len(real_hits)} entity)",
-        }
-    except Exception as exc:
-        return {
-            "verdict": VERDICT_ERROR,
-            "emoji": VERDICT_EMOJI[VERDICT_ERROR],
-            "detail": f"screening failed: {exc}",
-        }
-
-
-# Module-level cache for the registered font name. We pay the registration
-# cost (and potential GitHub download) once per process; subsequent PDF
-# generations reuse this. Without caching, every PDF would re-register and
-# potentially re-download.
-_CYRILLIC_FONT_CACHE: str | None = None
-
-
-def _register_cyrillic_font_for_pdf() -> str:
-    """Register a Unicode-capable font with reportlab for Cyrillic support.
-
-    ReportLab's built-in fonts (Helvetica, Times-Roman) only cover Latin-1.
-    Without a registered Cyrillic-capable font, every Russian glyph in bank
-    names renders as ``■`` (the "missing glyph" tofu box).
-
-    Strategy in priority order:
-      1. Use the cached font name from a previous call (no I/O).
-      2. Check matplotlib's bundled DejaVu Sans — matplotlib ships it as a
-         pip-installable dependency, so if it's in the environment for
-         charting we can borrow its font file at no extra cost.
-      3. Check standard system font paths populated by ``fonts-dejavu-core``
-         (installed via ``packages.txt`` on Streamlit Cloud) and other
-         common Linux/macOS/Windows locations.
-      4. Download DejaVu Sans from the dejavu-fonts GitHub repo as a last
-         resort. Cached in ``/tmp/DejaVuSans.ttf`` so subsequent calls in
-         the same container are fast.
-      5. Fall back to Helvetica with no Cyrillic — better than crashing,
-         but the PDF will still have tofu boxes for Russian text.
-
-    Returns the registered font name.
-    """
-    global _CYRILLIC_FONT_CACHE
-    if _CYRILLIC_FONT_CACHE is not None:
-        return _CYRILLIC_FONT_CACHE
-
-    try:
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-    except ImportError:
-        _CYRILLIC_FONT_CACHE = "Helvetica"
-        return _CYRILLIC_FONT_CACHE
-
-    # Build search list in priority order
-    candidates: list[str] = []
-
-    # matplotlib's bundled DejaVu — most reliable across deployments since
-    # matplotlib is a common transitive dependency and ships the font
-    try:
-        import matplotlib  # noqa: F401  (only used for data path)
-        mpl_path = os.path.join(
-            matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans.ttf"
-        )
-        candidates.append(mpl_path)
-    except Exception:
-        pass
-
-    # System font paths
-    candidates.extend([
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/local/share/fonts/DejaVuSans.ttf",
-        "/Library/Fonts/Arial Unicode.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-        "/tmp/DejaVuSans.ttf",  # downloaded-and-cached from a prior call
-    ])
-
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                pdfmetrics.registerFont(TTFont("BankFont", path))
-                _CYRILLIC_FONT_CACHE = "BankFont"
-                return _CYRILLIC_FONT_CACHE
-            except Exception:
-                continue
-
-    # GitHub download fallback — used when neither matplotlib nor any system
-    # font path worked. dejavu-fonts is permissively licensed (Bitstream Vera
-    # license) so redistribution is fine.
-    download_path = "/tmp/DejaVuSans.ttf"
-    try:
-        font_url = (
-            "https://github.com/dejavu-fonts/dejavu-fonts/raw/"
-            "version_2_37/ttf/DejaVuSans.ttf"
-        )
-        r = requests.get(font_url, timeout=30)
-        r.raise_for_status()
-        with open(download_path, "wb") as f:
-            f.write(r.content)
-        pdfmetrics.registerFont(TTFont("BankFont", download_path))
-        _CYRILLIC_FONT_CACHE = "BankFont"
-        return _CYRILLIC_FONT_CACHE
-    except Exception:
-        pass
-
-    # Final fallback — Cyrillic will be tofu boxes but PDF still generates
-    _CYRILLIC_FONT_CACHE = "Helvetica"
-    return _CYRILLIC_FONT_CACHE
-
-
-def generate_screening_pdf(
-    banks_with_verdicts: list[tuple[dict[str, str], dict[str, str]]],
-    *,
-    filter_to: set[str] | None = None,
-    full_screening_counts: dict[str, int] | None = None,
-) -> bytes:
-    """Render the bulk-screening table as a PDF.
-
-    Args:
-        banks_with_verdicts: list of (bank_info, verdict_info) tuples where
-            bank_info has bik/name/inn keys and verdict_info has verdict/
-            emoji/detail keys.
-        filter_to: optional set of verdict constants (e.g. ``{VERDICT_WHITELISTED}``).
-            If set, only banks whose verdict is in this set appear in the PDF.
-            The cover paragraph reports both the filtered count and the
-            ``full_screening_counts`` so the document is self-explanatory.
-        full_screening_counts: total verdict counts across the unfiltered
-            screening run, used in the cover paragraph for context. If None,
-            counts are computed from ``banks_with_verdicts`` post-filter.
-
-    Layout: cover paragraph with summary counts, then a single sorted table
-    (red first, then yellow, then white, green, error). Row backgrounds are
-    color-coded by verdict so the file is scannable when printed.
-
-    Verdict cells in the table use **text-only labels** (no emoji prefix)
-    because the registered Cyrillic font (DejaVu Sans) doesn't carry color
-    emoji glyphs — using emoji would render as tofu boxes and obscure the
-    real text. Row background colors already convey severity visually.
-
-    Raises a clear error message if reportlab is not installed — this is
-    common during initial deployment when ``requirements.txt`` hasn't been
-    refreshed alongside the source file.
-    """
-    # Apply filter if requested. Done first so all downstream sorting,
-    # counting, and rendering only sees the filtered set.
-    if filter_to is not None:
-        banks_with_verdicts = [
-            (b, v) for b, v in banks_with_verdicts if v.get("verdict") in filter_to
-        ]
-
-    try:
-        from io import BytesIO
-        from reportlab.lib.pagesizes import A4
-        from reportlab.platypus import (
-            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-        )
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib import colors
-        from reportlab.lib.units import cm
-    except ImportError as exc:
-        raise RuntimeError(
-            f"reportlab not installed ({exc}). "
-            "Commit the updated `requirements.txt` (it must include "
-            "`reportlab>=4.0`) and reboot the Streamlit app — secrets "
-            "or settings changes don't pull new packages, a deploy push "
-            "or manual reboot does."
-        ) from exc
-
-    font_name = _register_cyrillic_font_for_pdf()
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        leftMargin=1.5 * cm,
-        rightMargin=1.5 * cm,
-        topMargin=1.5 * cm,
-        bottomMargin=1.5 * cm,
-        title="Russian Banks — OpenSanctions Screening",
-    )
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        "BulkTitle", parent=styles["Title"], fontName=font_name, fontSize=16, spaceAfter=8,
-    )
-    body_style = ParagraphStyle(
-        "BulkBody", parent=styles["Normal"], fontName=font_name, fontSize=9,
-    )
-    cell_style = ParagraphStyle(
-        "BulkCell", parent=styles["Normal"], fontName=font_name, fontSize=8, leading=10,
-    )
-
-    counts: dict[str, int] = {}
-    for _, v in banks_with_verdicts:
-        counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
-
-    # Title varies with filter — a filtered PDF should make its scope clear
-    # so a reader who picks it up out of context understands what's in it.
-    if filter_to == {VERDICT_WHITELISTED}:
-        title_text = "Russian Banks — Whitelisted (Not Under US/EU Sanctions)"
-    elif filter_to:
-        labels = ", ".join(sorted(filter_to))
-        title_text = f"Russian Banks — {labels}"
-    else:
-        title_text = "Russian Banks — OpenSanctions Screening"
-
-    story: list[Any] = []
-    story.append(Paragraph(title_text, title_style))
-
-    # Cover paragraph: source, filter scope, and verdict logic
-    cover_lines = [
-        f"Source: bik-info.ru/base.xml &nbsp;·&nbsp; "
-        f"Banks in this PDF: <b>{len(banks_with_verdicts)}</b>"
-    ]
-    if full_screening_counts:
-        total_full = sum(full_screening_counts.values())
-        cover_lines.append(
-            f"Full screening covered <b>{total_full}</b> banks total; "
-            "this PDF is filtered to "
-            + (
-                "whitelisted only"
-                if filter_to == {VERDICT_WHITELISTED}
-                else ", ".join(sorted(filter_to)) if filter_to else "all verdicts"
-            )
-            + "."
-        )
-    cover_lines.append(
-        "Verdict logic: input-SWIFT whitelist → strict identifier search "
-        "(BIK / SWIFT / INN) → OS-SWIFT whitelist → OFAC split."
-    )
-    story.append(Paragraph("<br/>".join(cover_lines), body_style))
-    story.append(Spacer(1, 8))
-
-    # Verdict counts. Use full counts when available so a filtered PDF still
-    # shows the population context (e.g. "190 whitelisted out of 1430 total").
-    # Plain-text labels — no emoji, since the registered Cyrillic font
-    # doesn't carry color emoji glyphs.
-    display_counts = full_screening_counts if full_screening_counts else counts
-    summary_html = " &nbsp;·&nbsp; ".join(
-        f"<b>{k}:</b> {display_counts.get(k, 0)}"
-        for k in (VERDICT_MATCH, VERDICT_REVIEW, VERDICT_WHITELISTED, VERDICT_CLEAR, VERDICT_ERROR)
-        if display_counts.get(k, 0) > 0
-    )
-    if summary_html:
-        story.append(Paragraph(summary_html, body_style))
-        story.append(Spacer(1, 12))
-
-    # Sort: most severe first (red, yellow, then white, green, errors)
-    order = {
-        VERDICT_MATCH: 0,
-        VERDICT_REVIEW: 1,
-        VERDICT_WHITELISTED: 2,
-        VERDICT_CLEAR: 3,
-        VERDICT_ERROR: 4,
-    }
-    sorted_banks = sorted(
-        banks_with_verdicts,
-        key=lambda x: (order.get(x[1]["verdict"], 99), x[0].get("bik", "")),
-    )
-
-    table_data: list[list[Any]] = [["BIC", "Bank Name", "Verdict"]]
-    for bank, verdict in sorted_banks:
-        name = bank.get("name", "") or "(no name)"
-        # Truncate very long names to keep the row at a sane height
-        if len(name) > 120:
-            name = name[:117] + "…"
-        # Text-only verdict label — no emoji prefix, because DejaVu Sans
-        # doesn't carry color emoji glyphs and they'd render as tofu boxes.
-        # The row background color (set via table style below) conveys
-        # severity visually.
-        verdict_cell = f"<b>{verdict['verdict']}</b>"
-        if verdict.get("detail"):
-            verdict_cell += f"<br/><font size='7' color='#666666'>{verdict['detail']}</font>"
-        table_data.append([
-            Paragraph(bank.get("bik", ""), cell_style),
-            Paragraph(name, cell_style),
-            Paragraph(verdict_cell, cell_style),
-        ])
-
-    table = Table(
-        table_data,
-        colWidths=[2.4 * cm, 10.5 * cm, 4.6 * cm],
-        repeatRows=1,  # repeat header on every page
-    )
-    table_style_cmds = [
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
-        ("TEXTCOLOR",  (0, 0), (-1, 0), colors.white),
-        ("FONTNAME",   (0, 0), (-1, -1), font_name),
-        ("FONTSIZE",   (0, 0), (-1, 0), 10),
-        ("ALIGN",      (0, 0), (-1, 0), "CENTER"),
-        ("VALIGN",     (0, 0), (-1, -1), "TOP"),
-        ("GRID",       (0, 0), (-1, -1), 0.4, colors.HexColor("#cccccc")),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ("TOPPADDING",    (0, 0), (-1, -1), 3),
-    ]
-    # Per-row tinting by verdict
-    row_tint = {
-        VERDICT_MATCH:       colors.HexColor("#fee2e2"),  # light red
-        VERDICT_REVIEW:      colors.HexColor("#fef3c7"),  # light amber
-        VERDICT_WHITELISTED: colors.HexColor("#dcfce7"),  # light green
-        VERDICT_CLEAR:       colors.HexColor("#f9fafb"),  # very light grey
-        VERDICT_ERROR:       colors.HexColor("#e5e7eb"),  # neutral grey
-    }
-    for i, (_, v) in enumerate(sorted_banks, start=1):
-        tint = row_tint.get(v["verdict"])
-        if tint is not None:
-            table_style_cmds.append(("BACKGROUND", (0, i), (-1, i), tint))
-    table.setStyle(TableStyle(table_style_cmds))
-    story.append(table)
-
-    doc.build(story)
-    return buffer.getvalue()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Custom Excel upload — screen a user-provided list of BICs
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Header names we'll auto-detect for the BIC column. Order-insensitive,
-# case-insensitive, substring-matched. Covers Russian/English/casual variants
-# that show up in payroll/vendor lists.
-_BIC_HEADER_KEYWORDS: tuple[str, ...] = (
-    "bank identification code",  # standard verbose form
-    "bik",                        # Russian transliteration
-    "bic",                        # international form
-    "бик",                        # Cyrillic
-)
-
-
-def _find_bic_column(df: "pd.DataFrame") -> str | None:
-    """Auto-detect which column in an uploaded DataFrame holds BICs.
-
-    Returns the column name, or None if no plausible BIC column was found.
-    """
-    for col in df.columns:
-        col_lower = str(col).lower().strip()
-        for kw in _BIC_HEADER_KEYWORDS:
-            if kw in col_lower:
-                return col
-    return None
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def _build_bik_info_map() -> dict[str, dict[str, str]]:
-    """Build {BIK: {name, inn}} lookup from base.xml for in-memory name resolution.
-
-    Used by the custom Excel-upload flow so we can attach a bank name and INN
-    to each screened BIC without making per-BIC bik-info.ru calls. Reuses the
-    24h-cached base.xml fetch.
-    """
-    banks = fetch_bank_list_from_base_xml()
-    return {
-        b["bik"]: {"name": b.get("name", ""), "inn": b.get("inn", "")}
-        for b in banks
-    }
-
-
-def screen_uploaded_excel(
-    uploaded_bytes: bytes,
-    api_key: str,
-    progress_cb: "callable | None" = None,
-) -> "tuple[pd.DataFrame, dict[str, Any]]":
-    """Screen all BICs in an uploaded Excel and return an annotated DataFrame.
-
-    Reads every sheet of the uploaded ``.xlsx``, auto-detects the BIC column,
-    normalises BICs to 9-digit form (zero-pads 8-digit values), screens each
-    *unique* BIC via the cached ``screen_bank_simple``, and appends two
-    columns to the original data:
-
-      - ``Bank Name`` — from base.xml when available, blank otherwise
-      - ``Verdict`` — one of ✅ WHITELISTED / 🔴 MATCH / 🟡 REVIEW / 🟢 CLEAR
-        / ⚠️ ERROR, with a short detail in parentheses
-
-    The original columns are preserved unchanged. Rows without a BIC (or with
-    a malformed BIC) get blank verdict/name cells rather than rejecting the
-    whole file.
-
-    Returns ``(annotated_df, info)`` where ``info`` includes the BIC column
-    name, the per-verdict counts, and any errors encountered.
-    """
-    import io
-    df = pd.read_excel(io.BytesIO(uploaded_bytes), dtype=str)
-    bic_col = _find_bic_column(df)
-    if not bic_col:
-        return df, {
-            "error": (
-                "Couldn't auto-detect a BIC column. Expected a header "
-                "containing 'BIC', 'BIK', 'Bank Identification Code', or "
-                f"'БИК'. Found columns: {list(df.columns)}"
-            )
-        }
-
-    # Normalise: trim whitespace, drop non-digits, zero-pad 8-digit values to 9
-    def _normalise(raw: object) -> str | None:
-        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-            return None
-        s = "".join(c for c in str(raw) if c.isdigit())
-        if not s:
-            return None
-        if len(s) == 8:
-            s = "0" + s
-        return s if len(s) == 9 else None
-
-    df["_bic_norm"] = df[bic_col].apply(_normalise)
-
-    bik_info_map = _build_bik_info_map()
-    # Filter to strings only — apply() returns None but pandas coerces None
-    # to NaN inside a Series, and `if b` doesn't catch NaN (it's truthy).
-    unique_bics = sorted({
-        b for b in df["_bic_norm"].tolist() if isinstance(b, str)
-    })
-
-    # Screen each unique BIC once (cached). The cache key includes the api_key
-    # so different keys get separate caches, but within a single run the same
-    # BIC repeated across rows costs us one screening, not N.
-    verdict_for: dict[str, dict[str, str]] = {}
-    name_for: dict[str, str] = {}
-    for i, bic in enumerate(unique_bics):
-        info = bik_info_map.get(bic, {})
-        name = info.get("name", "")
-        inn = info.get("inn", "")
-        verdict_for[bic] = screen_bank_simple(bic, name, inn, api_key)
-        name_for[bic] = name
-        if progress_cb is not None:
-            progress_cb(i + 1, len(unique_bics), bic, name, verdict_for[bic])
-
-    # Build the annotated columns. For rows without a BIC, leave cells blank.
-    def _verdict_cell(bic: str | None) -> str:
-        if not bic or bic not in verdict_for:
-            return ""
-        v = verdict_for[bic]
-        cell = f"{v['emoji']} {v['verdict']}"
-        if v.get("detail"):
-            cell += f" — {v['detail']}"
-        return cell
-
-    df["Bank Name"] = df["_bic_norm"].apply(
-        lambda b: name_for.get(b, "") if b else ""
-    )
-    df["Verdict"] = df["_bic_norm"].apply(_verdict_cell)
-
-    # Drop the helper column from the output
-    df = df.drop(columns=["_bic_norm"])
-
-    counts: dict[str, int] = {}
-    for v in verdict_for.values():
-        counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
-
-    return df, {
-        "bic_col": bic_col,
-        "n_unique": len(unique_bics),
-        "n_rows": len(df),
-        "counts": counts,
-        "error": None,
-    }
-
-
-def annotated_xlsx_bytes(df: "pd.DataFrame") -> bytes:
-    """Serialise an annotated DataFrame to .xlsx bytes for download.
-
-    Adds light formatting: bold header row, freeze the header, autosize
-    columns for legibility. No formulas (everything is final values).
-    """
-    from io import BytesIO
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, PatternFill
-    from openpyxl.utils import get_column_letter
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Screened"
-
-    # Header
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=str(col_name))
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", start_color="1F2937")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    # Data rows. Tint verdict cells by category so the file is scannable when
-    # opened in Excel.
-    verdict_tint = {
-        "MATCH":       "FEE2E2",  # light red
-        "REVIEW":      "FEF3C7",  # light amber
-        "WHITELISTED": "DCFCE7",  # light green
-        "CLEAR":       "F9FAFB",  # neutral light grey
-        "ERROR":       "E5E7EB",  # neutral grey
-    }
-    verdict_col_idx = None
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        if col_name == "Verdict":
-            verdict_col_idx = col_idx
-            break
-
-    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
-        for col_idx, value in enumerate(row, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=value if pd.notna(value) else "")
-        # Tint the whole row by verdict
-        if verdict_col_idx is not None:
-            verdict_text = str(row[verdict_col_idx - 1] or "")
-            for key, hex_color in verdict_tint.items():
-                if key in verdict_text:
-                    for col_idx in range(1, len(df.columns) + 1):
-                        ws.cell(row=row_idx, column=col_idx).fill = PatternFill(
-                            "solid", start_color=hex_color
-                        )
-                    break
-
-    # Freeze header
-    ws.freeze_panes = "A2"
-
-    # Autosize columns (approximate — based on max content length)
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        max_len = max(
-            [len(str(col_name))]
-            + [len(str(v)) for v in df.iloc[:, col_idx - 1].fillna("").tolist()]
-        )
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 60)
-
-    buf = BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2092,314 +1402,7 @@ with st.sidebar:
         "🟢 **Clear** — no whitelist, no strict hit"
     )
 
-    # ── Bulk screening: full Russian-bank list as PDF ─────────────────
-    st.markdown("---")
-    with st.expander("📊 Full bank list (PDF)", expanded=False):
-        st.caption(
-            "Bulk-screen every Russian bank in "
-            "[bik-info.ru/base.xml](https://bik-info.ru/base/base.xml) and "
-            "produce a PDF of **whitelisted banks only** (not under US/EU "
-            "sanctions) — the actionable list for transacting safely."
-        )
-        if st.button("🔄 Generate / refresh PDF", use_container_width=True):
-            st.session_state["bulk_pdf_run"] = True
-            st.session_state["bulk_pdf"] = None
-        if st.session_state.get("bulk_pdf"):
-            st.success(
-                f"PDF ready — {st.session_state.get('bulk_pdf_count', '?')} "
-                f"whitelisted banks · generated "
-                f"{st.session_state.get('bulk_pdf_when', '')}"
-            )
-            st.download_button(
-                "⬇️ Download PDF",
-                data=st.session_state["bulk_pdf"],
-                file_name="russian_banks_whitelisted.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-        else:
-            st.caption(
-                "_The first run takes a few minutes (one /search per bank). "
-                "Subsequent runs reuse the per-bank cache (1h TTL)._"
-            )
-
-    # ── Custom Excel upload: screen a user-provided list ──────────────
-    with st.expander("📋 Custom list (Excel)", expanded=False):
-        st.caption(
-            "Upload an `.xlsx` with a BIC column and get it back with "
-            "**Verdict** and **Bank Name** columns appended. The BIC column "
-            "is auto-detected (header containing _BIC_, _BIK_, _Bank "
-            "Identification Code_, or _БИК_). 8-digit BICs are zero-padded "
-            "to 9 digits. Same verdict logic as the single-BIC screening."
-        )
-        custom_file = st.file_uploader(
-            "Upload .xlsx", type=["xlsx"], key="custom_upload",
-            label_visibility="collapsed",
-        )
-        if custom_file is not None:
-            if st.button(
-                "🔄 Screen this list", use_container_width=True, key="custom_run_btn"
-            ):
-                # Save file bytes for the gate to read. We capture bytes
-                # rather than the file handle because the handle doesn't
-                # survive across reruns.
-                st.session_state["custom_upload_bytes"] = custom_file.getvalue()
-                st.session_state["custom_upload_filename"] = custom_file.name
-                st.session_state["custom_upload_run"] = True
-                st.session_state["custom_xlsx"] = None
-        if st.session_state.get("custom_xlsx"):
-            orig_name = st.session_state.get(
-                "custom_upload_filename", "uploaded.xlsx"
-            )
-            base_name = orig_name.rsplit(".", 1)[0]
-            st.success(
-                f"Annotated file ready · {st.session_state.get('custom_n_rows', '?')} "
-                f"rows · {st.session_state.get('custom_n_unique', '?')} unique BICs"
-            )
-            st.download_button(
-                "⬇️ Download annotated .xlsx",
-                data=st.session_state["custom_xlsx"],
-                file_name=f"{base_name}_screened.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key="custom_download_btn",
-            )
-
-# ── Bulk PDF generation (runs in place of regular screening) ─────────────
-# Triggered by the sidebar button which sets session_state["bulk_pdf_run"].
-# We handle it here, before the regular BIC input, so the bulk flow can run
-# without requiring the user to also enter a BIC. The final `st.stop()`
-# below prevents the regular screening UI from rendering on top.
-if st.session_state.get("bulk_pdf_run") and not st.session_state.get("bulk_pdf"):
-    st.markdown("## 📊 Bulk screening — generating PDF")
-    st.caption(
-        "Fetching the full Russian bank list from bik-info.ru/base.xml, "
-        "running the same verdict logic as the interactive tool, and "
-        "compiling a PDF. The first run takes a few minutes; per-bank "
-        "results are cached for 1 hour so subsequent runs are faster."
-    )
-    bulk_progress = st.progress(0.0)
-    bulk_status = st.empty()
-
-    bulk_status.info("Step 1/3 · Fetching base.xml from bik-info.ru…")
-    banks = fetch_bank_list_from_base_xml()
-    if not banks:
-        st.error(
-            "Couldn't fetch or parse `https://bik-info.ru/base/base.xml`. "
-            "The endpoint may be temporarily unavailable or the XML schema "
-            "may have changed. Click **Generate / refresh PDF** again later, "
-            "or check the network from the deployment."
-        )
-        st.session_state["bulk_pdf_run"] = False
-        st.stop()
-    bulk_status.info(
-        f"Step 2/3 · Screening {len(banks)} banks against OpenSanctions "
-        "(cached per BIC, so already-screened banks are instant)…"
-    )
-
-    # Per-bank screening with progress updates
-    results: list[tuple[dict[str, str], dict[str, str]]] = []
-    for i, bank in enumerate(banks):
-        verdict = screen_bank_simple(
-            bank["bik"],
-            bank.get("name", ""),
-            bank.get("inn", ""),
-            OPENSANCTIONS_API_KEY,
-        )
-        results.append((bank, verdict))
-        # Update progress + status every bank (cheap), or every 10 if many
-        bulk_progress.progress((i + 1) / len(banks))
-        if i % 10 == 0 or i == len(banks) - 1:
-            short_name = (bank.get("name") or bank["bik"])[:60]
-            bulk_status.info(
-                f"Step 2/3 · {i + 1}/{len(banks)} — `{bank['bik']}` "
-                f"{short_name} → {verdict['emoji']} {verdict['verdict']}"
-            )
-
-    bulk_status.info("Step 3/3 · Rendering PDF…")
-
-    # Compute full screening counts (across all 1430 banks) for the cover
-    # paragraph. The PDF itself is filtered to WHITELISTED only — those are
-    # the actionable, transactable banks — but the cover shows the broader
-    # population context so the document is interpretable on its own.
-    full_counts: dict[str, int] = {}
-    for _, v in results:
-        full_counts[v["verdict"]] = full_counts.get(v["verdict"], 0) + 1
-
-    try:
-        pdf_bytes = generate_screening_pdf(
-            results,
-            filter_to={VERDICT_WHITELISTED},
-            full_screening_counts=full_counts,
-        )
-    except Exception as exc:
-        st.error(f"PDF generation failed: {exc}")
-        st.session_state["bulk_pdf_run"] = False
-        st.stop()
-
-    n_whitelisted = full_counts.get(VERDICT_WHITELISTED, 0)
-
-    # Persist in session state so the sidebar's download button picks it up
-    # on the next rerun (sidebar already rendered before the bulk job ran).
-    from datetime import datetime
-    st.session_state["bulk_pdf"] = pdf_bytes
-    st.session_state["bulk_pdf_count"] = n_whitelisted
-    st.session_state["bulk_pdf_when"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    st.session_state["bulk_pdf_run"] = False
-
-    bulk_progress.empty()
-    bulk_status.success(
-        f"✅ PDF generated — {n_whitelisted} whitelisted banks "
-        f"(out of {len(banks)} screened)."
-    )
-
-    # Render the download button INLINE in the main panel. The sidebar is
-    # already rendered at this point so it'd take a rerun to update there,
-    # and a rerun would clear the visible success message + verdict summary.
-    # Inline is the better UX: download button sits right where the user's
-    # eyes already are, and the sidebar will pick it up on next rerun.
-    st.download_button(
-        "⬇️ Download PDF",
-        data=pdf_bytes,
-        file_name=f"russian_banks_whitelisted_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.pdf",
-        mime="application/pdf",
-        type="primary",
-    )
-
-    # Verdict summary
-    counts: dict[str, int] = {}
-    for _, v in results:
-        counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
-    summary = " · ".join(
-        f"{VERDICT_EMOJI[k]} **{k}**: {counts.get(k, 0)}"
-        for k in (VERDICT_MATCH, VERDICT_REVIEW, VERDICT_WHITELISTED, VERDICT_CLEAR, VERDICT_ERROR)
-    )
-    st.markdown(summary)
-    st.caption(
-        "_The download button also appears in the sidebar after your next "
-        "interaction with the app (e.g. screening a single BIC). The PDF "
-        "stays available for the rest of this browser session._"
-    )
-    st.stop()
-
-# ── Custom Excel screening (runs in place of regular screening) ──────────
-# Triggered by the sidebar uploader + "Screen this list" button which sets
-# session_state["custom_upload_run"]. We handle it here, before the regular
-# BIC input, so the user doesn't also need to enter a single BIC. The final
-# `st.stop()` prevents the regular screening UI from rendering on top.
-if st.session_state.get("custom_upload_run") and not st.session_state.get("custom_xlsx"):
-    st.markdown("## 📋 Custom list — screening")
-    st.caption(
-        f"Processing **{st.session_state.get('custom_upload_filename', 'uploaded file')}** "
-        "with the same verdict logic as the interactive tool: input-SWIFT "
-        "whitelist → strict identifier search (BIK / SWIFT / INN) → "
-        "OS-SWIFT whitelist → OFAC split."
-    )
-
-    cu_progress = st.progress(0.0)
-    cu_status = st.empty()
-    cu_status.info("Step 1/2 · Reading the uploaded Excel and detecting BIC column…")
-
-    try:
-        # Pre-flight: peek at the file to give the user immediate feedback
-        # about the detected BIC column and total rows.
-        import io as _io
-        peek_df = pd.read_excel(
-            _io.BytesIO(st.session_state["custom_upload_bytes"]), dtype=str
-        )
-        peek_col = _find_bic_column(peek_df)
-        if not peek_col:
-            st.error(
-                "Couldn't auto-detect a BIC column. Expected a header "
-                "containing _BIC_, _BIK_, _Bank Identification Code_, or "
-                f"_БИК_. Found columns: `{list(peek_df.columns)}`. "
-                "Rename your BIC column to one of those and re-upload."
-            )
-            st.session_state["custom_upload_run"] = False
-            st.stop()
-
-        # Count unique BICs upfront so we can show meaningful progress
-        unique_norm = sorted({
-            ("0" + "".join(c for c in str(b) if c.isdigit())[:8])
-            if len("".join(c for c in str(b) if c.isdigit())) == 8
-            else "".join(c for c in str(b) if c.isdigit())
-            for b in peek_df[peek_col].dropna().tolist()
-            if "".join(c for c in str(b) if c.isdigit())
-        })
-        unique_norm = [b for b in unique_norm if len(b) == 9]
-        cu_status.info(
-            f"Step 1/2 · ✓ BIC column: **{peek_col}** · "
-            f"{len(peek_df)} rows · {len(unique_norm)} unique BICs"
-        )
-
-        # Per-BIC progress callback. Updates the progress bar and the status
-        # line as each unique BIC is screened.
-        def _progress_cb(i: int, total: int, bic: str, name: str, verdict: dict):
-            cu_progress.progress(i / max(1, total))
-            short_name = (name or "(unnamed)")[:60]
-            cu_status.info(
-                f"Step 2/2 · {i}/{total} — `{bic}` {short_name} → "
-                f"{verdict['emoji']} {verdict['verdict']}"
-            )
-
-        annotated_df, info = screen_uploaded_excel(
-            st.session_state["custom_upload_bytes"],
-            OPENSANCTIONS_API_KEY,
-            progress_cb=_progress_cb,
-        )
-
-        if info.get("error"):
-            st.error(info["error"])
-            st.session_state["custom_upload_run"] = False
-            st.stop()
-
-        # Serialise to xlsx and persist for the sidebar download button
-        xlsx_bytes = annotated_xlsx_bytes(annotated_df)
-        st.session_state["custom_xlsx"] = xlsx_bytes
-        st.session_state["custom_n_rows"] = info["n_rows"]
-        st.session_state["custom_n_unique"] = info["n_unique"]
-        st.session_state["custom_upload_run"] = False
-
-        cu_progress.empty()
-        cu_status.success(
-            f"✅ Annotated file ready — {info['n_rows']} rows, "
-            f"{info['n_unique']} unique BICs screened."
-        )
-
-        # Inline download button (mirrors the bulk-PDF UX — sidebar version
-        # appears on next rerun)
-        orig_name = st.session_state.get("custom_upload_filename", "uploaded.xlsx")
-        base_name = orig_name.rsplit(".", 1)[0]
-        st.download_button(
-            "⬇️ Download annotated .xlsx",
-            data=xlsx_bytes,
-            file_name=f"{base_name}_screened.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            key="custom_inline_download",
-        )
-
-        # Verdict count summary
-        counts = info.get("counts", {})
-        summary = " · ".join(
-            f"{VERDICT_EMOJI[k]} **{k}**: {counts.get(k, 0)}"
-            for k in (VERDICT_MATCH, VERDICT_REVIEW, VERDICT_WHITELISTED,
-                      VERDICT_CLEAR, VERDICT_ERROR)
-            if counts.get(k, 0) > 0
-        )
-        if summary:
-            st.markdown("**Across unique BICs:** " + summary)
-
-        # Show a preview of the annotated data
-        st.markdown("### Preview")
-        st.dataframe(annotated_df, use_container_width=True, hide_index=True)
-
-    except Exception as exc:
-        st.error(f"Screening failed: {exc}")
-        st.session_state["custom_upload_run"] = False
-        st.stop()
-
-    st.stop()
+# ── Regular single-BIC screening ─────────────────────────────────────────
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -2913,8 +1916,10 @@ if whitelist_hits:
         "This bank's SWIFT appears on the curated list of **Russian banks NOT under "
         "US (SDN) and EU sanctions**:\n\n"
         f"{hits_str}\n\n"
-        "_Source: OhMySwift.xlsx (compiled from iban.ru's classification of Russian "
-        "banks against the US SDN list and EU consolidated sanctions)._\n\n"
+        "_Source: [ohmyswift.io/ne-pod-sankciyami-spisok]"
+        "(https://ohmyswift.io/ne-pod-sankciyami-spisok) — Russian banks "
+        "confirmed absent from the US SDN list and EU consolidated sanctions "
+        "(fetched live, cached 24h)._\n\n"
         "_Per the verdict spec, OpenSanctions strict-identifier search is skipped "
         "when whitelisted. The whitelist covers US + EU only — if you need to "
         "verify against UK, JP, CA, AU, CH, or UA sanctions specifically, run an "
